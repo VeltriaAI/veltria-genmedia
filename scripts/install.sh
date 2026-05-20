@@ -38,11 +38,15 @@ banner() {
 }
 
 prompt() {
+  # IMPORTANT: prompt text MUST go to stderr — these helpers are called via
+  # VAR=$(prompt "…"), and command substitution captures stdout. If the
+  # question text went to stdout it would be silently swallowed into VAR
+  # and the user would just see a blinking cursor with no prompt.
   local question="$1"
   local default="${2:-}"
   local hint=""
   [ -n "$default" ] && hint=" ${DIM}[$default]${RESET}"
-  printf "%s?%s %s%s " "$YELLOW" "$RESET" "$question" "$hint"
+  printf "%s?%s %s%s " "$YELLOW" "$RESET" "$question" "$hint" >&2
   local answer
   read -r answer
   echo "${answer:-$default}"
@@ -50,10 +54,10 @@ prompt() {
 
 prompt_secret() {
   local question="$1"
-  printf "%s?%s %s " "$YELLOW" "$RESET" "$question"
+  printf "%s?%s %s " "$YELLOW" "$RESET" "$question" >&2
   local answer
   read -rs answer
-  echo
+  echo >&2
   echo "$answer"
 }
 
