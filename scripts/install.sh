@@ -168,18 +168,36 @@ fi
 GATEWAY_URL="${GATEWAY_URL%/}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1 — install the Python MCP server deps
+# Step 1 — install the Python MCP server deps into an isolated venv
+# (system-Python `pip install --user` is blocked on PEP-668 environments,
+# i.e. modern macOS Homebrew Python 3.12+ and Ubuntu 24.04+. A repo-local
+# venv side-steps that and keeps deps out of the user's system Python.)
 # ─────────────────────────────────────────────────────────────────────────────
 echo
-say "Step 1/5 — Installing MCP server (Python deps)…"
+say "Step 1/5 — Installing MCP server (Python deps into local venv)…"
 
-if ! python3 -c "import httpx, mcp" >/dev/null 2>&1; then
-  python3 -m pip install --user --quiet --upgrade httpx 'mcp>=1.2.0' 2>&1 | tail -5 || {
-    err "Failed to install httpx + mcp. Try manually:  python3 -m pip install --user httpx mcp"
+VENV_DIR="$REPO_ROOT/.venv"
+VENV_PY="$VENV_DIR/bin/python"
+
+if [ ! -x "$VENV_PY" ]; then
+  python3 -m venv "$VENV_DIR" || {
+    err "Failed to create venv at $VENV_DIR."
+    err "On Debian/Ubuntu you may need:  sudo apt install python3-venv"
     exit 1
   }
 fi
-ok "MCP server deps installed"
+
+"$VENV_PY" -m pip install --quiet --upgrade pip 2>&1 | tail -3 || true
+"$VENV_PY" -m pip install --upgrade httpx 'mcp>=1.2.0' 2>&1 | tail -8 || {
+  err "Failed to install httpx + mcp into $VENV_DIR."
+  err "Try manually:  $VENV_PY -m pip install httpx mcp"
+  exit 1
+}
+"$VENV_PY" -c "import httpx, mcp" 2>&1 || {
+  err "Post-install import check failed — httpx/mcp not importable from $VENV_PY"
+  exit 1
+}
+ok "MCP server deps installed in $VENV_DIR"
 
 chmod +x "$REPO_ROOT/mcp/server.py"
 
@@ -242,10 +260,10 @@ wire_claude_desktop() {
   [ -f "$CFG" ] || echo '{}' > "$CFG"
   cp "$CFG" "$CFG.backup-$(date +%Y%m%d-%H%M%S)"
   local new
-  new=$(jq --arg dir "$MCP_DIR" '
+  new=$(jq --arg py "$VENV_PY" --arg dir "$MCP_DIR" '
     .mcpServers = ((.mcpServers // {}) + {
       "veltria-genmedia": {
-        "command": "python3",
+        "command": $py,
         "args": [($dir + "/server.py")]
       }
     })
@@ -259,11 +277,11 @@ wire_claude_code() {
   [ -f "$CFG" ] || echo '{}' > "$CFG"
   cp "$CFG" "$CFG.backup-$(date +%Y%m%d-%H%M%S)"
   local new
-  new=$(jq --arg dir "$MCP_DIR" '
+  new=$(jq --arg py "$VENV_PY" --arg dir "$MCP_DIR" '
     .mcpServers = ((.mcpServers // {}) + {
       "veltria-genmedia": {
         "type": "stdio",
-        "command": "python3",
+        "command": $py,
         "args": [($dir + "/server.py")]
       }
     })

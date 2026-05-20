@@ -2,7 +2,7 @@
   "mcpServers": {
     "veltria-genmedia": {
       "type": "stdio",
-      "command": "python3",
+      "command": "REPLACE_WITH_HOME/skills/veltria-genmedia/.venv/bin/python",
       "args": ["REPLACE_WITH_HOME/skills/veltria-genmedia/mcp/server.py"]
     }
   }
