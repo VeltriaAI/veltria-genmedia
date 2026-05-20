@@ -20,7 +20,10 @@ import asyncio
 import base64
 import mimetypes
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -245,11 +248,58 @@ def _push_image_url(out: list[dict[str, str]], url: str) -> None:
         out.append({"url": url})
 
 
-# Veo single-shot generation tops out at 8 seconds. For longer clips we chain
-# via /v1/videos/extensions, each extension adding up to 8 more sec onto the
-# previous video. So a 24-sec ask = 1 base (8) + 2 extensions (8 each).
+# Veo single-shot generation tops out at 8 seconds. LiteLLM's
+# /v1/videos/extensions route exists but Vertex AI implementation is NOT
+# wired upstream ("video extension is not supported for Vertex AI"), so
+# we can't chain via the gateway. Instead we frame-chain client-side:
+#   1. Generate base 8-sec clip
+#   2. Extract its last frame with ffmpeg
+#   3. Use that frame as input_reference for the next 8-sec clip
+#   4. Concatenate all chunks with ffmpeg
+# Result: a single continuous MP4 with visual continuity across joins.
 VEO_CHUNK_MAX = 8
 VEO_CHUNK_MIN = 5  # Veo rejects < 5 sec per chunk
+
+
+def _have_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def _extract_last_frame(video_path: Path, out_png: Path) -> None:
+    """Pull the final frame of an MP4 out as a PNG, for use as the
+    input_reference seed of the next chunk."""
+    # Probe duration so we can ask ffmpeg for that exact second.
+    dur = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    seek = max(0.0, float(dur) - 0.1)
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-ss", f"{seek:.2f}", "-i", str(video_path),
+         "-frames:v", "1", str(out_png)],
+        check=True,
+    )
+
+
+def _concat_videos(chunks: list[Path], out_path: Path) -> None:
+    """Stream-copy concat (no re-encode) so quality is preserved. Veo chunks
+    share codec + dimensions, so concat demuxer works without filter graph."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        for c in chunks:
+            # ffmpeg concat list: escape single quotes
+            f.write(f"file '{str(c).replace(chr(39), chr(92) + chr(39))}'\n")
+        list_path = f.name
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c", "copy", str(out_path)],
+            check=True,
+        )
+    finally:
+        os.unlink(list_path)
 
 
 def _aspect_to_size(aspect_ratio: str | None) -> str | None:
@@ -296,6 +346,33 @@ async def _poll_video_job(
     raise RuntimeError(f"Video job {job_id} timed out (raise VIDEO_TIMEOUT in gateway.env)")
 
 
+async def _gen_one_video_chunk(
+    client: httpx.AsyncClient,
+    *,
+    base: str,
+    headers: dict[str, str],
+    model: str,
+    prompt: str,
+    seconds: int,
+    size: str | None,
+    reference_image_uri: str | None,
+    deadline: float,
+) -> bytes:
+    """Single Veo generation: POST → poll → GET content. Returns raw MP4 bytes."""
+    payload: dict[str, Any] = {"model": model, "prompt": prompt, "seconds": seconds}
+    if size:
+        payload["size"] = size
+    if reference_image_uri:
+        payload["input_reference"] = reference_image_uri
+    resp = await client.post(f"{base}/v1/videos", json=payload, headers=headers)
+    resp.raise_for_status()
+    video_id = resp.json()["id"]
+    await _poll_video_job(client, base=base, headers=headers, job_id=video_id, deadline=deadline)
+    cr = await client.get(f"{base}/v1/videos/{video_id}/content", headers=headers)
+    cr.raise_for_status()
+    return cr.content
+
+
 async def call_video(
     cfg: dict[str, str],
     *,
@@ -306,78 +383,92 @@ async def call_video(
     raw: bool,
     reference_image: str | None = None,
 ) -> dict[str, Any]:
-    """Async Veo flow:
+    """Generate a video clip. Two regimes:
 
-      1. POST /v1/videos              → returns a job (status: processing)
-      2. GET  /v1/videos/{id}         → poll until status: completed/failed
-      3. If duration > 8s, chain:
-         POST /v1/videos/extensions   → new job extending the prior one
-         (poll again, repeat until target duration reached)
-      4. GET  /v1/videos/{id}/content → MP4 bytes
+      duration_sec ≤ 8  → one Veo call, async (POST → poll → content)
+      duration_sec  > 8 → frame-chain client-side:
+          * Generate base 8-sec clip
+          * Extract last frame with ffmpeg
+          * Use it as input_reference for next 8-sec clip
+          * Concatenate all chunks (stream-copy, no re-encode)
 
-    Returns {'_video_bytes': bytes, '_video_id': str, '_seconds': int}.
-    The bytes are saved to disk by save_video_result().
+    Veo's gateway-side extension route would be the cleaner approach, but
+    LiteLLM hasn't wired it up for Vertex AI yet (errors with "video
+    extension is not supported for Vertex AI"). Frame-chain works on any
+    Veo backend and gives smoother joins than independent clips.
+
+    Returns {'_video_bytes': bytes, '_seconds': int, '_chunks': int}.
     """
     full_prompt = _brand_prefix(cfg, raw) + prompt
     headers = _headers(cfg)
     base = cfg["GATEWAY_BASE_URL"].rstrip("/")
     job_timeout = int(cfg.get("VIDEO_TIMEOUT", "600"))
-    deadline = time.time() + job_timeout
 
-    # Clamp: Veo refuses <5s per chunk; cap the overall ask to keep runaway
-    # extension chains from blowing budget by accident.
     total = max(VEO_CHUNK_MIN, min(int(duration_sec), 60))
-
-    # Plan: first chunk up to 8s, then 8s extensions until we hit the target.
-    first_chunk = min(total, VEO_CHUNK_MAX)
-    remaining = total - first_chunk
-
     size = _aspect_to_size(aspect_ratio)
+    initial_ref = _load_reference(reference_image) if reference_image else None
 
-    # 1. Initial generation
-    init_payload: dict[str, Any] = {
-        "model": model,
-        "prompt": full_prompt,
-        "seconds": first_chunk,
-    }
-    if size:
-        init_payload["size"] = size
-    if reference_image:
-        # OpenAI Sora-style field name; LiteLLM maps it to Vertex's image-to-
-        # video input for Veo.
-        init_payload["input_reference"] = _load_reference(reference_image)
+    # Single-chunk fast path
+    if total <= VEO_CHUNK_MAX:
+        async with httpx.AsyncClient(timeout=job_timeout) as client:
+            deadline = time.time() + job_timeout
+            mp4 = await _gen_one_video_chunk(
+                client, base=base, headers=headers,
+                model=model, prompt=full_prompt, seconds=total, size=size,
+                reference_image_uri=initial_ref, deadline=deadline,
+            )
+        return {"_video_bytes": mp4, "_seconds": total, "_chunks": 1}
 
-    async with httpx.AsyncClient(timeout=job_timeout) as client:
-        resp = await client.post(f"{base}/v1/videos", json=init_payload, headers=headers)
-        resp.raise_for_status()
-        job = resp.json()
-        video_id = job["id"]
-        await _poll_video_job(client, base=base, headers=headers, job_id=video_id, deadline=deadline)
+    # Multi-chunk: needs ffmpeg for frame extraction + concat
+    if not _have_ffmpeg():
+        raise RuntimeError(
+            "ffmpeg + ffprobe required for clips > 8 seconds (frame-chain assembly). "
+            "Install via:  brew install ffmpeg  (macOS)  /  sudo apt install ffmpeg  (Linux)"
+        )
 
-        # 2. Extensions (only if user asked for > 8s)
-        while remaining > 0:
-            chunk = min(VEO_CHUNK_MAX, max(VEO_CHUNK_MIN, remaining))
-            ext_payload = {
-                "model": model,
-                "prompt": full_prompt,
-                "seconds": chunk,
-                "video": {"id": video_id},
-            }
-            er = await client.post(f"{base}/v1/videos/extensions", json=ext_payload, headers=headers)
-            er.raise_for_status()
-            video_id = er.json()["id"]
-            await _poll_video_job(client, base=base, headers=headers, job_id=video_id, deadline=deadline)
-            remaining -= chunk
+    # Plan: chunks of 8 sec each. Last chunk may be 5-8 sec; if remainder < 5,
+    # bump it to 5 and overshoot — Veo rejects sub-5 chunks.
+    chunk_sizes: list[int] = []
+    remaining = total
+    while remaining > 0:
+        if remaining >= VEO_CHUNK_MAX:
+            chunk_sizes.append(VEO_CHUNK_MAX)
+            remaining -= VEO_CHUNK_MAX
+        elif remaining >= VEO_CHUNK_MIN:
+            chunk_sizes.append(remaining)
+            remaining = 0
+        else:
+            chunk_sizes.append(VEO_CHUNK_MIN)
+            remaining = 0  # tolerates a slight overshoot
 
-        # 3. Fetch the bytes
-        cr = await client.get(f"{base}/v1/videos/{video_id}/content", headers=headers)
-        cr.raise_for_status()
+    chunk_paths: list[Path] = []
+    tmpdir = Path(tempfile.mkdtemp(prefix="veltria-genmedia-"))
+    try:
+        async with httpx.AsyncClient(timeout=job_timeout) as client:
+            current_ref = initial_ref
+            for i, sec in enumerate(chunk_sizes):
+                deadline = time.time() + job_timeout
+                mp4 = await _gen_one_video_chunk(
+                    client, base=base, headers=headers,
+                    model=model, prompt=full_prompt, seconds=sec, size=size,
+                    reference_image_uri=current_ref, deadline=deadline,
+                )
+                chunk_path = tmpdir / f"chunk-{i:02d}.mp4"
+                chunk_path.write_bytes(mp4)
+                chunk_paths.append(chunk_path)
+                # Seed the NEXT chunk with this one's last frame.
+                if i + 1 < len(chunk_sizes):
+                    frame_path = tmpdir / f"seed-{i+1:02d}.png"
+                    _extract_last_frame(chunk_path, frame_path)
+                    current_ref = _load_reference(str(frame_path))
 
-    return {
-        "_video_bytes": cr.content,
-        "_video_id": video_id,
-        "_seconds": total,
-    }
+        final_path = tmpdir / "final.mp4"
+        _concat_videos(chunk_paths, final_path)
+        bytes_out = final_path.read_bytes()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return {"_video_bytes": bytes_out, "_seconds": sum(chunk_sizes), "_chunks": len(chunk_sizes)}
 
 
 async def call_chat(cfg: dict[str, str], *, prompt: str, model: str, system: str | None) -> str:

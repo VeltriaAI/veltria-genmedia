@@ -158,6 +158,7 @@ install_prereqs_macos() {
       curl) ;;                         # ships with macOS
       jq)   brew_pkgs+=(jq) ;;
       git)  brew_pkgs+=(git) ;;
+      ffmpeg) brew_pkgs+=(ffmpeg) ;;
       python3) brew_pkgs+=(python@3.12) ;;
     esac
   done
@@ -178,6 +179,7 @@ install_prereqs_apt() {
       curl) pkgs+=(curl) ;;
       jq)   pkgs+=(jq) ;;
       git)  pkgs+=(git) ;;
+      ffmpeg) pkgs+=(ffmpeg) ;;
       python3) pkgs+=(python3 python3-venv python3-pip) ;;
     esac
   done
@@ -195,6 +197,7 @@ install_prereqs_dnf() {
       curl) pkgs+=(curl) ;;
       jq)   pkgs+=(jq) ;;
       git)  pkgs+=(git) ;;
+      ffmpeg) pkgs+=(ffmpeg) ;;
       python3) pkgs+=(python3 python3-virtualenv python3-pip) ;;
     esac
   done
@@ -207,10 +210,11 @@ bootstrap_prereqs() {
   [ "${GENMEDIA_SKIP_PREREQS:-0}" = "1" ] && return 0
 
   local missing=()
-  command -v curl >/dev/null 2>&1 || missing+=("curl")
-  command -v jq   >/dev/null 2>&1 || missing+=("jq")
-  command -v git  >/dev/null 2>&1 || missing+=("git")
-  python_ok                       || missing+=("python3")
+  command -v curl   >/dev/null 2>&1 || missing+=("curl")
+  command -v jq     >/dev/null 2>&1 || missing+=("jq")
+  command -v git    >/dev/null 2>&1 || missing+=("git")
+  command -v ffmpeg >/dev/null 2>&1 || missing+=("ffmpeg")
+  python_ok                         || missing+=("python3")
 
   [ ${#missing[@]} -eq 0 ] && { ok "Prerequisites OK"; return 0; }
 
@@ -225,10 +229,11 @@ bootstrap_prereqs() {
 
   # Re-check after install
   local still_missing=()
-  command -v curl >/dev/null 2>&1 || still_missing+=("curl")
-  command -v jq   >/dev/null 2>&1 || still_missing+=("jq")
-  command -v git  >/dev/null 2>&1 || still_missing+=("git")
-  python_ok                       || still_missing+=("python3 (3.11+ with venv)")
+  command -v curl   >/dev/null 2>&1 || still_missing+=("curl")
+  command -v jq     >/dev/null 2>&1 || still_missing+=("jq")
+  command -v git    >/dev/null 2>&1 || still_missing+=("git")
+  command -v ffmpeg >/dev/null 2>&1 || still_missing+=("ffmpeg")
+  python_ok                         || still_missing+=("python3 (3.11+ with venv)")
   if [ ${#still_missing[@]} -gt 0 ]; then
     err "After install attempt, still missing: ${still_missing[*]}"
     err "Install manually and re-run."
