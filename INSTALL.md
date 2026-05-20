@@ -12,7 +12,7 @@ Sets up `veltria-genmedia` so Claude Desktop and/or Claude Code can generate ima
 - **Python 3.11+** → `brew install python@3.12` (macOS) or your distro's package manager
 - **`jq`** → `brew install jq` (macOS) or `apt install jq` (Linux)
 - **`curl`** — usually already there
-- **`gh`** if you want to clone via the GitHub CLI (optional, you can use `git clone` too)
+- **`git`** — for the bootstrap clone
 - **An MCP-capable client**: [Claude Desktop](https://claude.ai/download) and/or [Claude Code](https://claude.ai/code)
 
 You also need two things from whoever runs your gateway:
@@ -24,18 +24,35 @@ You also need two things from whoever runs your gateway:
 
 ## Run the wizard
 
+**Curl one-liner (self-cloning):**
+
 ```bash
-gh repo clone VeltriaAI/veltria-genmedia ~/skills/veltria-genmedia
-cd ~/skills/veltria-genmedia
-./scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/VeltriaAI/veltria-genmedia/main/scripts/install.sh | bash
 ```
 
-Or with plain git:
+The script detects it's being piped and clones itself to `~/skills/veltria-genmedia` first, then continues.
+
+**Safer two-step (inspect before running):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VeltriaAI/veltria-genmedia/main/scripts/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+**Manual clone:**
 
 ```bash
 git clone https://github.com/VeltriaAI/veltria-genmedia.git ~/skills/veltria-genmedia
 cd ~/skills/veltria-genmedia
 ./scripts/install.sh
+```
+
+**Custom install location** — set `GENMEDIA_INSTALL_DIR`:
+
+```bash
+GENMEDIA_INSTALL_DIR=$HOME/tools/genmedia \
+  bash <(curl -fsSL https://raw.githubusercontent.com/VeltriaAI/veltria-genmedia/main/scripts/install.sh)
 ```
 
 You'll be asked five questions:

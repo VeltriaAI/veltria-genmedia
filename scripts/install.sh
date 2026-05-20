@@ -62,7 +62,36 @@ prompt_secret() {
 # ─────────────────────────────────────────────────────────────────────────────
 banner
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ─────────────────────────────────────────────────────────────────────────────
+# Bootstrap — when run via `curl | bash`, BASH_SOURCE is /dev/fd/N and the
+# repo isn't on disk yet. Detect that and clone first, then re-exec from
+# the clone so the rest of the script can use relative paths normally.
+# ─────────────────────────────────────────────────────────────────────────────
+REPO_URL="${GENMEDIA_REPO_URL:-https://github.com/VeltriaAI/veltria-genmedia.git}"
+REPO_BRANCH="${GENMEDIA_REPO_BRANCH:-main}"
+INSTALL_DIR="${GENMEDIA_INSTALL_DIR:-$HOME/skills/veltria-genmedia}"
+
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR_RAW="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd || echo "")"
+
+if [ -z "$SCRIPT_DIR_RAW" ] || [ ! -f "$SCRIPT_DIR_RAW/../mcp/server.py" ]; then
+  say "Bootstrap — cloning $REPO_URL → $INSTALL_DIR"
+  command -v git >/dev/null 2>&1 || { err "git not found. Install git first."; exit 1; }
+  if [ -d "$INSTALL_DIR/.git" ]; then
+    git -C "$INSTALL_DIR" fetch --quiet origin "$REPO_BRANCH"
+    git -C "$INSTALL_DIR" checkout --quiet "$REPO_BRANCH"
+    git -C "$INSTALL_DIR" pull --quiet --ff-only origin "$REPO_BRANCH"
+    ok "Repo refreshed at $INSTALL_DIR"
+  else
+    mkdir -p "$(dirname "$INSTALL_DIR")"
+    git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
+    ok "Repo cloned to $INSTALL_DIR"
+  fi
+  say "Re-executing installer from clone…"
+  exec bash "$INSTALL_DIR/scripts/install.sh" "$@"
+fi
+
+SCRIPT_DIR="$SCRIPT_DIR_RAW"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 say "Running from: $REPO_ROOT"
 

@@ -40,9 +40,32 @@ Models are configured at your **gateway**, not in this repo. Whatever names your
 
 ## Quick install
 
+**One-liner (recommended):**
+
 ```bash
-gh repo clone VeltriaAI/veltria-genmedia ~/skills/veltria-genmedia
+curl -fsSL https://raw.githubusercontent.com/VeltriaAI/veltria-genmedia/main/scripts/install.sh | bash
+```
+
+The installer self-clones to `~/skills/veltria-genmedia` and re-executes from there. If you'd rather inspect first (good practice for any `curl | bash`), download then run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VeltriaAI/veltria-genmedia/main/scripts/install.sh -o install.sh
+less install.sh           # review it
+bash install.sh
+```
+
+**Manual clone:**
+
+```bash
+git clone https://github.com/VeltriaAI/veltria-genmedia.git ~/skills/veltria-genmedia
 ~/skills/veltria-genmedia/scripts/install.sh
+```
+
+**Custom install location:**
+
+```bash
+GENMEDIA_INSTALL_DIR=$HOME/tools/genmedia \
+  bash <(curl -fsSL https://raw.githubusercontent.com/VeltriaAI/veltria-genmedia/main/scripts/install.sh)
 ```
 
 The wizard asks for:
