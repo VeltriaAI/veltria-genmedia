@@ -40,7 +40,9 @@ fi
 ok "Gateway reachable"
 
 # 2. Auth check via /v1/models
-case "${AUTH_HEADER,,}" in
+# Lowercase via tr so we work on macOS bash 3.2 (no ${var,,} support).
+AUTH_HEADER_LOWER=$(printf '%s' "$AUTH_HEADER" | tr '[:upper:]' '[:lower:]')
+case "$AUTH_HEADER_LOWER" in
   authorization)
     AUTH_ARGS=(-H "Authorization: Bearer ${GATEWAY_API_KEY}")
     ;;
