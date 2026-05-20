@@ -106,16 +106,27 @@ def _brand_prefix(cfg: dict[str, str], raw: bool) -> str:
     return (preset + " ") if preset else ""
 
 
+def _guess_mime(p: Path) -> str:
+    mime, _ = mimetypes.guess_type(p.name)
+    if mime:
+        return mime
+    return {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif",
+        ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+    }.get(p.suffix.lower(), "application/octet-stream")
+
+
 def _load_reference(path_or_url: str) -> str:
-    """Resolve a reference image/video input to a value the gateway can ingest.
+    """Resolve a reference input to a data: URI / passthrough URL.
+
+    Used for IMAGE generation (multimodal chat completions), where OpenAI-
+    compatible gateways accept data: URIs in image_url content blocks.
 
     Accepts:
-      - http(s):// URLs → returned as-is (gateway fetches them)
+      - http(s):// URLs → returned as-is
       - data:... URIs   → returned as-is
-      - local file paths → read bytes, base64-encode, return a data: URI
-
-    Returns a string usable as `image_url.url` in chat/completions multimodal
-    content, or as the value of an `image` field in video payloads.
+      - local file paths → read bytes, base64-encode → data: URI
     """
     s = path_or_url.strip()
     if s.startswith(("http://", "https://", "data:")):
@@ -123,16 +134,49 @@ def _load_reference(path_or_url: str) -> str:
     p = Path(_expand(s))
     if not p.is_file():
         raise RuntimeError(f"Reference not found at {p} (give an absolute path, http(s):// URL, or data: URI)")
-    mime, _ = mimetypes.guess_type(p.name)
-    if not mime:
-        # Reasonable defaults by suffix; fall back to octet-stream.
-        mime = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".webp": "image/webp", ".gif": "image/gif",
-            ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
-        }.get(p.suffix.lower(), "application/octet-stream")
     b64 = base64.b64encode(p.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+    return f"data:{_guess_mime(p)};base64,{b64}"
+
+
+def _load_reference_for_veo(path_or_url: str) -> dict[str, str]:
+    """Resolve a reference image for VIDEO generation (Vertex Veo via LiteLLM).
+
+    Vertex Veo rejects data: URIs and http(s):// URLs — it requires either a
+    GCS URI or an inline base64 dict. LiteLLM mirrors that constraint at the
+    /v1/videos endpoint. Accepted shapes:
+
+      - gs://bucket/path                  → {"gcsUri": "gs://..."}
+      - http(s):// URL                    → fetch bytes ourselves, then b64
+      - data:image/...;base64,...         → split, return dict
+      - local file path                   → read bytes, b64-encode
+    """
+    s = path_or_url.strip()
+    if s.startswith("gs://"):
+        return {"gcsUri": s}
+
+    if s.startswith("data:"):
+        # data:<mime>;base64,<payload>
+        try:
+            head, payload = s.split(",", 1)
+            mime = head.split(":", 1)[1].split(";", 1)[0] or "image/png"
+            return {"bytesBase64Encoded": payload, "mimeType": mime}
+        except (IndexError, ValueError) as e:
+            raise RuntimeError(f"Malformed data: URI: {e}") from e
+
+    if s.startswith(("http://", "https://")):
+        # Veo can't fetch external URLs itself; pull the bytes here and inline.
+        with httpx.Client(timeout=60) as c:
+            r = c.get(s)
+            r.raise_for_status()
+            mime = r.headers.get("content-type", "image/png").split(";")[0]
+            b64 = base64.b64encode(r.content).decode("ascii")
+            return {"bytesBase64Encoded": b64, "mimeType": mime}
+
+    p = Path(_expand(s))
+    if not p.is_file():
+        raise RuntimeError(f"Reference not found at {p} (give an absolute path, http(s):// URL, gs:// URI, or data: URI)")
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return {"bytesBase64Encoded": b64, "mimeType": _guess_mime(p)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,15 +399,16 @@ async def _gen_one_video_chunk(
     prompt: str,
     seconds: int,
     size: str | None,
-    reference_image_uri: str | None,
+    reference_image_dict: dict[str, str] | None,
     deadline: float,
 ) -> bytes:
     """Single Veo generation: POST → poll → GET content. Returns raw MP4 bytes."""
     payload: dict[str, Any] = {"model": model, "prompt": prompt, "seconds": seconds}
     if size:
         payload["size"] = size
-    if reference_image_uri:
-        payload["input_reference"] = reference_image_uri
+    if reference_image_dict:
+        # Vertex Veo expects a dict here: {bytesBase64Encoded, mimeType} or {gcsUri}.
+        payload["input_reference"] = reference_image_dict
     resp = await client.post(f"{base}/v1/videos", json=payload, headers=headers)
     resp.raise_for_status()
     video_id = resp.json()["id"]
@@ -461,7 +506,7 @@ async def call_video(
 
     total = max(VEO_CHUNK_MIN, min(int(duration_sec), 60))
     size = _aspect_to_size(aspect_ratio)
-    initial_ref = _load_reference(reference_image) if reference_image else None
+    initial_ref = _load_reference_for_veo(reference_image) if reference_image else None
 
     # Single-chunk fast path
     if total <= VEO_CHUNK_MAX:
@@ -470,7 +515,7 @@ async def call_video(
             mp4 = await _gen_one_video_chunk(
                 client, base=base, headers=headers,
                 model=model, prompt=full_prompt, seconds=total, size=size,
-                reference_image_uri=initial_ref, deadline=deadline,
+                reference_image_dict=initial_ref, deadline=deadline,
             )
         return {"_video_bytes": mp4, "_seconds": total, "_chunks": 1}
 
@@ -524,16 +569,16 @@ async def call_video(
                 mp4 = await _gen_one_video_chunk(
                     client, base=base, headers=headers,
                     model=model, prompt=chunk_prompts[i], seconds=sec, size=size,
-                    reference_image_uri=current_ref, deadline=deadline,
+                    reference_image_dict=current_ref, deadline=deadline,
                 )
                 chunk_path = tmpdir / f"chunk-{i:02d}.mp4"
                 chunk_path.write_bytes(mp4)
                 chunk_paths.append(chunk_path)
-                # Seed the NEXT chunk with this one's last frame.
+                # Seed the NEXT chunk with this one's last frame (Veo-shaped dict).
                 if i + 1 < n_chunks:
                     frame_path = tmpdir / f"seed-{i+1:02d}.png"
                     _extract_last_frame(chunk_path, frame_path)
-                    current_ref = _load_reference(str(frame_path))
+                    current_ref = _load_reference_for_veo(str(frame_path))
 
         final_path = tmpdir / "final.mp4"
         _concat_videos(chunk_paths, final_path)
