@@ -361,12 +361,15 @@ if [ ! -x "$VENV_PY" ]; then
   }
 fi
 
-"$VENV_PY" -m pip install --quiet --upgrade pip 2>&1 | tail -3 || true
-"$VENV_PY" -m pip install --upgrade httpx 'mcp>=1.2.0' 2>&1 | tail -8 || {
+say "    (downloading httpx + mcp + deps — usually 30-60s on first run)"
+"$VENV_PY" -m pip install --disable-pip-version-check --upgrade --quiet pip || true
+# Run pip *without* piping to tail so each line of progress streams live —
+# otherwise the user sees a blank terminal for 30-60s and thinks it's stuck.
+if ! "$VENV_PY" -m pip install --disable-pip-version-check --progress-bar off --upgrade httpx 'mcp>=1.2.0'; then
   err "Failed to install httpx + mcp into $VENV_DIR."
   err "Try manually:  $VENV_PY -m pip install httpx mcp"
   exit 1
-}
+fi
 "$VENV_PY" -c "import httpx, mcp" 2>&1 || {
   err "Post-install import check failed — httpx/mcp not importable from $VENV_PY"
   exit 1

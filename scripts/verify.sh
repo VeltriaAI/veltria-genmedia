@@ -33,8 +33,8 @@ ok "Config loaded: $CFG"
 ok "Gateway: $GATEWAY_BASE_URL"
 
 # 1. DNS / TCP reachable
-if ! curl -sk --connect-timeout 5 "$GATEWAY_BASE_URL" -o /dev/null; then
-  fail "Cannot reach $GATEWAY_BASE_URL (DNS or network issue)"
+if ! curl -sk --connect-timeout 5 --max-time 10 "$GATEWAY_BASE_URL" -o /dev/null; then
+  fail "Cannot reach $GATEWAY_BASE_URL (DNS, network, or unresponsive server)"
   exit 1
 fi
 ok "Gateway reachable"
@@ -49,7 +49,9 @@ case "${AUTH_HEADER,,}" in
     ;;
 esac
 
+# --max-time so a wedged gateway can't hang the wizard forever.
 http_code=$(curl -sk -o /tmp/genmedia-verify.out -w "%{http_code}" \
+  --connect-timeout 10 --max-time 30 \
   "${AUTH_ARGS[@]}" \
   "${GATEWAY_BASE_URL%/}/v1/models" || echo "000")
 
@@ -86,6 +88,7 @@ if [ "${1:-}" = "--image" ]; then
   fi
   payload=$(jq -nc --arg m "$DEFAULT_IMAGE_MODEL" '{model:$m,prompt:"a simple smiley face on white background",n:1,response_format:"b64_json"}')
   http_code=$(curl -sk -o /tmp/genmedia-verify-img.out -w "%{http_code}" \
+    --connect-timeout 10 --max-time 120 \
     "${AUTH_ARGS[@]}" \
     -H "Content-Type: application/json" \
     -X POST \
