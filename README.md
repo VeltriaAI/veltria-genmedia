@@ -28,13 +28,33 @@ Originally built as the media-generation layer for the [Veltria Beings Protocol]
 
 ## What's inside
 
-| Tool exposed to your MCP client | Models (whatever your gateway routes to) |
-|---|---|
-| `gen_image` | Nano Banana, Imagen, DALL·E, FLUX, … |
-| `gen_video` | Veo, Sora, Runway, … |
-| `gen_text` | Gemini Flash, Claude Haiku, GPT-4o-mini, … |
+| Tool exposed to your MCP client | Models (whatever your gateway routes to) | Reference media? |
+|---|---|---|
+| `gen_image` | Nano Banana, Imagen, DALL·E, FLUX, … | ✓ `reference_images` (list) — for edit / restyle / composition / style reference |
+| `gen_video` | Veo, Sora, Runway, … | ✓ `reference_image` (single) — for image-to-video / first-frame seed |
+| `gen_text` | Gemini Flash, Claude Haiku, GPT-4o-mini, … | — |
 
 Models are configured at your **gateway**, not in this repo. Whatever names your gateway exposes (`gpt-image-1`, `nano-banana`, `veo-3`, …) are the names you pass via the `model` argument. The server is provider-agnostic.
+
+### Reference media
+
+Both image and video tools accept reference inputs. Each is either an absolute file path, an `http(s)://` URL, or a `data:` URI:
+
+```
+gen_image(
+  prompt="Make this look like a Studio Ghibli scene",
+  model="nano-banana",
+  reference_images=["/Users/you/Desktop/photo.png"],
+)
+
+gen_video(
+  prompt="Slow zoom in, golden-hour light",
+  model="veo-3",
+  reference_image="/Users/you/Desktop/logo.png",
+)
+```
+
+When `reference_images` is set, `gen_image` routes via `/v1/chat/completions` with multimodal content blocks (the shape Gemini 2.5/3, GPT-4o, and Claude understand). Without references it uses `/v1/images/generations` as before. `gen_video` always uses `/v1/video/generations`; the reference image is passed as the first-frame seed.
 
 ---
 

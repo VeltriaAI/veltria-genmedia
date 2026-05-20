@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import mimetypes
 import os
 import sys
 import time
@@ -102,29 +103,161 @@ def _brand_prefix(cfg: dict[str, str], raw: bool) -> str:
     return (preset + " ") if preset else ""
 
 
+def _load_reference(path_or_url: str) -> str:
+    """Resolve a reference image/video input to a value the gateway can ingest.
+
+    Accepts:
+      - http(s):// URLs → returned as-is (gateway fetches them)
+      - data:... URIs   → returned as-is
+      - local file paths → read bytes, base64-encode, return a data: URI
+
+    Returns a string usable as `image_url.url` in chat/completions multimodal
+    content, or as the value of an `image` field in video payloads.
+    """
+    s = path_or_url.strip()
+    if s.startswith(("http://", "https://", "data:")):
+        return s
+    p = Path(_expand(s))
+    if not p.is_file():
+        raise RuntimeError(f"Reference not found at {p} (give an absolute path, http(s):// URL, or data: URI)")
+    mime, _ = mimetypes.guess_type(p.name)
+    if not mime:
+        # Reasonable defaults by suffix; fall back to octet-stream.
+        mime = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".gif": "image/gif",
+            ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+        }.get(p.suffix.lower(), "application/octet-stream")
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gateway calls
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-async def call_image(cfg: dict[str, str], *, prompt: str, model: str, n: int, size: str | None, raw: bool) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+async def call_image(
+    cfg: dict[str, str],
+    *,
+    prompt: str,
+    model: str,
+    n: int,
+    size: str | None,
+    raw: bool,
+    reference_images: list[str] | None = None,
+) -> dict[str, Any]:
+    """Two code paths:
+
+      - WITHOUT references → POST /v1/images/generations (OpenAI text-to-image)
+      - WITH references    → POST /v1/chat/completions  (multimodal: text + image
+        content blocks). This is the shape Gemini 2.5/3 Flash Image, Claude,
+        GPT-4o, etc. understand for "edit / compose / use this as reference".
+
+    Returns a dict in a unified shape: {"data": [{"b64_json": "..."} or {"url": "..."}]}
+    so save_image_result() doesn't care which endpoint we used.
+    """
+    full_prompt = _brand_prefix(cfg, raw) + prompt
+    timeout = int(cfg.get("IMAGE_TIMEOUT", "120"))
+    base = cfg["GATEWAY_BASE_URL"].rstrip("/")
+
+    if reference_images:
+        # Multimodal chat-completions path. n is intentionally ignored — chat
+        # APIs return one assistant message per call; loop client-side if you
+        # want more variants.
+        content: list[dict[str, Any]] = [{"type": "text", "text": full_prompt}]
+        for ref in reference_images:
+            content.append({"type": "image_url", "image_url": {"url": _load_reference(ref)}})
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            # Some gateways honour these; harmless when ignored.
+            "modalities": ["image", "text"],
+        }
+        url = base + "/v1/chat/completions"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload, headers=_headers(cfg))
+        resp.raise_for_status()
+        return _normalize_chat_image_response(resp.json())
+
+    # Text-to-image path (unchanged).
+    payload = {
         "model": model,
-        "prompt": _brand_prefix(cfg, raw) + prompt,
+        "prompt": full_prompt,
         "n": n,
         "response_format": "b64_json",
     }
     if size:
         payload["size"] = size
-    timeout = int(cfg.get("IMAGE_TIMEOUT", "120"))
-    url = cfg["GATEWAY_BASE_URL"].rstrip("/") + "/v1/images/generations"
+    url = base + "/v1/images/generations"
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(url, json=payload, headers=_headers(cfg))
     resp.raise_for_status()
     return resp.json()
 
 
-async def call_video(cfg: dict[str, str], *, prompt: str, model: str, duration_sec: int, aspect_ratio: str | None, raw: bool) -> dict[str, Any]:
+def _normalize_chat_image_response(raw: dict[str, Any]) -> dict[str, Any]:
+    """Pull image bytes/URLs out of a chat-completions response and reshape to
+    the /v1/images/generations envelope: {"data": [{"b64_json": "..."}, ...]}.
+
+    Gateways differ in where they put the image:
+      - choices[0].message.images = [{"image_url": {"url": "data:image/png;base64,..."}}]
+      - choices[0].message.content = [{"type": "image", "source": {...b64...}}]   (Anthropic-style)
+      - choices[0].message.content = [{"type": "image_url", "image_url": {"url": "data:..."}}]
+      - choices[0].message.content = "<base64 blob>"  (some Vertex paths)
+    Handle each, skip text-only parts.
+    """
+    out: list[dict[str, str]] = []
+    for choice in raw.get("choices", []) or []:
+        msg = choice.get("message") or {}
+        # Modern LiteLLM/Gemini path
+        for item in msg.get("images") or []:
+            url = (item.get("image_url") or {}).get("url") or item.get("url")
+            if isinstance(url, str):
+                _push_image_url(out, url)
+        # Multimodal content blocks
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url")
+                    if isinstance(url, str):
+                        _push_image_url(out, url)
+                elif ptype in ("image", "output_image"):
+                    src = part.get("source") or {}
+                    if src.get("type") == "base64" and src.get("data"):
+                        out.append({"b64_json": src["data"]})
+                    elif src.get("type") == "url" and src.get("url"):
+                        _push_image_url(out, src["url"])
+                    elif part.get("b64_json"):
+                        out.append({"b64_json": part["b64_json"]})
+    return {"data": out, "_raw": raw}
+
+
+def _push_image_url(out: list[dict[str, str]], url: str) -> None:
+    """Append either a {b64_json} (if data: URI) or a {url} entry."""
+    if url.startswith("data:") and "base64," in url:
+        out.append({"b64_json": url.split("base64,", 1)[1]})
+    else:
+        out.append({"url": url})
+
+
+async def call_video(
+    cfg: dict[str, str],
+    *,
+    prompt: str,
+    model: str,
+    duration_sec: int,
+    aspect_ratio: str | None,
+    raw: bool,
+    reference_image: str | None = None,
+) -> dict[str, Any]:
+    """Text-to-video by default. If reference_image is given, attaches it as
+    the first-frame seed (Veo-style image-to-video conditioning).
+    """
     payload: dict[str, Any] = {
         "model": model,
         "prompt": _brand_prefix(cfg, raw) + prompt,
@@ -132,6 +265,8 @@ async def call_video(cfg: dict[str, str], *, prompt: str, model: str, duration_s
     }
     if aspect_ratio:
         payload["aspect_ratio"] = aspect_ratio
+    if reference_image:
+        payload["image"] = _load_reference(reference_image)
     timeout = int(cfg.get("VIDEO_TIMEOUT", "600"))
     url = cfg["GATEWAY_BASE_URL"].rstrip("/") + "/v1/video/generations"
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -216,18 +351,26 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="gen_image",
             description=(
-                "Generate one or more images via your configured OpenAI-compatible "
+                "Generate or EDIT images via your configured OpenAI-compatible "
                 "gateway. Model names must match what your gateway exposes (e.g. "
                 "'nano-banana', 'imagen-3', 'gpt-image-1', 'flux-pro'). "
-                "BRAND_PRESET (if configured) is auto-prepended unless raw=true."
+                "BRAND_PRESET (if configured) is auto-prepended unless raw=true. "
+                "Pass `reference_images` (file paths or URLs) to do image-to-image: "
+                "edit, restyle, compose, or use them as style/subject references. "
+                "Works best with multimodal models like nano-banana."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string", "description": "What to generate"},
+                    "prompt": {"type": "string", "description": "What to generate, or what to do with the reference(s)"},
                     "model": {"type": "string", "description": "Model name as configured on your gateway"},
-                    "n": {"type": "integer", "description": "Number of images", "default": 1, "minimum": 1, "maximum": 4},
+                    "n": {"type": "integer", "description": "Number of images (ignored when reference_images is used)", "default": 1, "minimum": 1, "maximum": 4},
                     "size": {"type": "string", "description": "e.g. 1024x1024, 1792x1024 (model-dependent)"},
+                    "reference_images": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of reference inputs. Each entry is either an absolute file path on disk (e.g. /Users/.../photo.png), an http(s):// URL, or a data: URI. When provided, routes via chat/completions for multimodal generation.",
+                    },
                     "output_dir": {"type": "string", "description": "Override default save directory"},
                     "raw": {"type": "boolean", "description": "Skip BRAND_PRESET injection", "default": False},
                 },
@@ -239,7 +382,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Generate a short video clip via your gateway. Model names must "
                 "match what your gateway exposes (e.g. 'veo-3', 'veo-2', "
-                "'sora-2', 'runway-gen3'). Videos are expensive — use thoughtfully."
+                "'sora-2', 'runway-gen3'). Pass `reference_image` to animate a "
+                "still photo (image-to-video / first-frame conditioning). "
+                "Videos are expensive — use thoughtfully."
             ),
             inputSchema={
                 "type": "object",
@@ -248,6 +393,10 @@ async def list_tools() -> list[Tool]:
                     "model": {"type": "string", "description": "Model name as configured on your gateway"},
                     "duration_sec": {"type": "integer", "description": "Clip length", "default": 5, "minimum": 1, "maximum": 30},
                     "aspect_ratio": {"type": "string", "description": "e.g. 16:9, 9:16, 1:1"},
+                    "reference_image": {
+                        "type": "string",
+                        "description": "Optional first-frame seed. File path on disk, http(s):// URL, or data: URI. Used for image-to-video animation.",
+                    },
                     "output_dir": {"type": "string"},
                     "raw": {"type": "boolean", "default": False},
                 },
@@ -284,6 +433,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     started = time.time()
 
     if name == "gen_image":
+        refs = arguments.get("reference_images")
+        if refs is not None and not isinstance(refs, list):
+            return [TextContent(type="text", text="❌ reference_images must be an array of file paths or URLs")]
         try:
             result = await call_image(
                 cfg,
@@ -292,6 +444,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 n=int(arguments.get("n", 1)),
                 size=arguments.get("size"),
                 raw=bool(arguments.get("raw", False)),
+                reference_images=refs,
             )
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"❌ Gateway error {e.response.status_code}: {e.response.text[:500]}")]
@@ -312,6 +465,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 duration_sec=int(arguments.get("duration_sec", 5)),
                 aspect_ratio=arguments.get("aspect_ratio"),
                 raw=bool(arguments.get("raw", False)),
+                reference_image=arguments.get("reference_image"),
             )
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"❌ Gateway error {e.response.status_code}: {e.response.text[:500]}")]
