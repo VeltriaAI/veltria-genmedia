@@ -9,11 +9,12 @@ Sets up `veltria-genmedia` so Claude Desktop and/or Claude Code can generate ima
 ## Prerequisites
 
 - **macOS or Linux** (Windows: untested — use WSL2)
-- **Python 3.11+** → `brew install python@3.12` (macOS) or your distro's package manager
-- **`jq`** → `brew install jq` (macOS) or `apt install jq` (Linux)
-- **`curl`** — usually already there
-- **`git`** — for the bootstrap clone
 - **An MCP-capable client**: [Claude Desktop](https://claude.ai/download) and/or [Claude Code](https://claude.ai/code)
+- **Admin rights** on your machine — the installer will ask for your password if it needs to install missing dependencies
+
+The wizard will detect and auto-install anything else it needs (Homebrew, jq, git, Python 3.11+, venv support). You don't have to set anything up by hand.
+
+Set `GENMEDIA_SKIP_PREREQS=1` to opt out of auto-install (useful in managed environments where you've already prepared the box).
 
 You also need two things from whoever runs your gateway:
 

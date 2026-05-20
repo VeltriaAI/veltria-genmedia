@@ -60,7 +60,156 @@ prompt_secret() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-flight
 # ─────────────────────────────────────────────────────────────────────────────
+
+# When invoked via `curl | bash`, our stdin is the curl pipe, not the terminal.
+# That breaks `read` prompts and (more importantly) Homebrew's own installer,
+# which refuses to run when stdin isn't a TTY. Reconnect to the user's terminal
+# so the wizard, sudo prompts, and any nested installers can read input.
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+  exec </dev/tty
+fi
+
 banner
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisite auto-install — handle a fresh laptop with no Homebrew,
+# missing jq, system Python that's too old, etc. Skip via GENMEDIA_SKIP_PREREQS=1.
+# Runs before the bootstrap clone because the clone needs `git`.
+# ─────────────────────────────────────────────────────────────────────────────
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux)
+      if   command -v apt-get >/dev/null 2>&1; then echo "linux-apt"
+      elif command -v dnf     >/dev/null 2>&1; then echo "linux-dnf"
+      elif command -v yum     >/dev/null 2>&1; then echo "linux-yum"
+      else echo "linux-unknown"
+      fi
+      ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+python_ok() {
+  command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null \
+    && python3 -c 'import venv' 2>/dev/null
+}
+
+prepend_brew_python() {
+  for p in /opt/homebrew/opt/python@3.12/libexec/bin \
+           /usr/local/opt/python@3.12/libexec/bin \
+           /opt/homebrew/opt/python@3.13/libexec/bin \
+           /usr/local/opt/python@3.13/libexec/bin; do
+    [ -d "$p" ] && export PATH="$p:$PATH" && return 0
+  done
+  return 0
+}
+
+install_prereqs_macos() {
+  if ! command -v brew >/dev/null 2>&1; then
+    say "Homebrew is required to install the missing tools."
+    say "It's the standard macOS package manager — takes ~5 minutes and will ask for your Mac password."
+    if [ "${HEADLESS:-0}" != "1" ]; then
+      printf "%s?%s Install Homebrew now? [Y/n] " "$YELLOW" "$RESET"
+      read -r yn </dev/tty || true
+      case "$yn" in [Nn]*) err "Cannot continue without Homebrew. Install it manually from https://brew.sh and re-run."; exit 1 ;; esac
+    fi
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+      || { err "Homebrew install failed."; exit 1; }
+    if   [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [ -x /usr/local/bin/brew    ]; then eval "$(/usr/local/bin/brew shellenv)"
+    fi
+  fi
+
+  local brew_pkgs=()
+  for m in "$@"; do
+    case "$m" in
+      curl) ;;                         # ships with macOS
+      jq)   brew_pkgs+=(jq) ;;
+      git)  brew_pkgs+=(git) ;;
+      python3) brew_pkgs+=(python@3.12) ;;
+    esac
+  done
+
+  if [ ${#brew_pkgs[@]} -gt 0 ]; then
+    say "Installing via Homebrew: ${brew_pkgs[*]}"
+    brew install "${brew_pkgs[@]}" || { err "brew install failed"; exit 1; }
+  fi
+  prepend_brew_python
+}
+
+install_prereqs_apt() {
+  local pkgs=()
+  for m in "$@"; do
+    case "$m" in
+      curl) pkgs+=(curl) ;;
+      jq)   pkgs+=(jq) ;;
+      git)  pkgs+=(git) ;;
+      python3) pkgs+=(python3 python3-venv python3-pip) ;;
+    esac
+  done
+  [ ${#pkgs[@]} -eq 0 ] && return 0
+  say "Installing via apt-get (sudo required): ${pkgs[*]}"
+  sudo apt-get update -qq
+  sudo apt-get install -y "${pkgs[@]}" || { err "apt install failed"; exit 1; }
+}
+
+install_prereqs_dnf() {
+  local pkgs=() pm
+  pm=$(command -v dnf || command -v yum)
+  for m in "$@"; do
+    case "$m" in
+      curl) pkgs+=(curl) ;;
+      jq)   pkgs+=(jq) ;;
+      git)  pkgs+=(git) ;;
+      python3) pkgs+=(python3 python3-virtualenv python3-pip) ;;
+    esac
+  done
+  [ ${#pkgs[@]} -eq 0 ] && return 0
+  say "Installing via $pm (sudo required): ${pkgs[*]}"
+  sudo "$pm" install -y "${pkgs[@]}" || { err "$pm install failed"; exit 1; }
+}
+
+bootstrap_prereqs() {
+  [ "${GENMEDIA_SKIP_PREREQS:-0}" = "1" ] && return 0
+
+  local missing=()
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  command -v jq   >/dev/null 2>&1 || missing+=("jq")
+  command -v git  >/dev/null 2>&1 || missing+=("git")
+  python_ok                       || missing+=("python3")
+
+  [ ${#missing[@]} -eq 0 ] && { ok "Prerequisites OK"; return 0; }
+
+  warn "Missing or outdated prerequisites: ${missing[*]}"
+  local os; os=$(detect_os)
+  case "$os" in
+    macos)     install_prereqs_macos "${missing[@]}" ;;
+    linux-apt) install_prereqs_apt   "${missing[@]}" ;;
+    linux-dnf|linux-yum) install_prereqs_dnf "${missing[@]}" ;;
+    *) err "Unsupported OS for automatic prereq install ($os). Install manually: ${missing[*]}"; exit 1 ;;
+  esac
+
+  # Re-check after install
+  local still_missing=()
+  command -v curl >/dev/null 2>&1 || still_missing+=("curl")
+  command -v jq   >/dev/null 2>&1 || still_missing+=("jq")
+  command -v git  >/dev/null 2>&1 || still_missing+=("git")
+  python_ok                       || still_missing+=("python3 (3.11+ with venv)")
+  if [ ${#still_missing[@]} -gt 0 ]; then
+    err "After install attempt, still missing: ${still_missing[*]}"
+    err "Install manually and re-run."
+    exit 1
+  fi
+  ok "Prerequisites installed and verified"
+}
+
+# Detect --headless early so bootstrap_prereqs knows whether to prompt
+HEADLESS=0
+[ "${1:-}" = "--headless" ] && HEADLESS=1
+
+bootstrap_prereqs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bootstrap — when run via `curl | bash`, BASH_SOURCE is /dev/fd/N and the
@@ -95,32 +244,12 @@ SCRIPT_DIR="$SCRIPT_DIR_RAW"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 say "Running from: $REPO_ROOT"
 
-# Prereqs
-say "Checking prerequisites…"
-missing=()
-for cmd in curl jq python3; do
-  command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
-done
-if [ ${#missing[@]} -gt 0 ]; then
-  err "Missing prerequisites: ${missing[*]}"
-  err "Install with your OS package manager (brew on macOS, apt/yum on Linux)"
-  exit 1
-fi
-
 PYV=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PY_OK=$(python3 -c 'import sys; print(int(sys.version_info >= (3, 11)))')
-if [ "$PY_OK" != "1" ]; then
-  err "Python ${PYV} found. Need Python 3.11+."
-  exit 1
-fi
-ok "Prereqs OK (Python $PYV)"
+ok "Using Python $PYV at $(command -v python3)"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inputs (interactive or headless)
+# Inputs (interactive or headless)  — HEADLESS already set above
 # ─────────────────────────────────────────────────────────────────────────────
-HEADLESS=0
-[ "${1:-}" = "--headless" ] && HEADLESS=1
-
 if [ "$HEADLESS" = "1" ]; then
   GATEWAY_URL="${GENMEDIA_GATEWAY_URL:-}"
   API_KEY="${GENMEDIA_API_KEY:-}"
