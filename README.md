@@ -69,6 +69,44 @@ A `duration_sec=24` request runs as three 8-sec Veo calls back-to-back with fram
 
 Requires `ffmpeg` + `ffprobe` on the user's machine (the installer adds them automatically).
 
+### Narrative scenes (per-chunk prompts)
+
+For long clips, three modes for what each chunk depicts:
+
+**Auto (default)** — server asks the gateway's text model to break your single prompt into N continuous scenes:
+
+```
+gen_video(
+  prompt="A coffee mug brand reel: starts on a clean white studio rotation, transitions to a sunlit kitchen counter, ends with a hand lifting the mug toward camera",
+  duration_sec=24,
+)
+# server internally splits into 3 scenes, generates each with continuity
+```
+
+**Explicit** — you supply one prompt per chunk:
+
+```
+gen_video(
+  prompt="Coffee mug brand reel",
+  duration_sec=24,
+  scene_prompts=[
+    "Product on a clean white background, slow rotation, studio key light",
+    "Same mug, smooth zoom out reveals it on a wooden kitchen counter at sunrise",
+    "A hand reaches in from the right and lifts the mug toward the camera",
+  ],
+)
+```
+
+**Continuous (no split)** — same prompt across every chunk, fully relying on frame-chain for continuity:
+
+```
+gen_video(
+  prompt="A coffee mug, steam rising, gentle slow zoom",
+  duration_sec=24,
+  auto_scene_split=False,
+)
+```
+
 ---
 
 ## Quick install

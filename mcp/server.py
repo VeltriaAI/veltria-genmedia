@@ -373,6 +373,59 @@ async def _gen_one_video_chunk(
     return cr.content
 
 
+async def _auto_split_scenes(
+    cfg: dict[str, str],
+    *,
+    overall_prompt: str,
+    n: int,
+    chunk_secs: list[int],
+) -> list[str]:
+    """Ask the gateway's text model to break a single user request into N
+    continuous scenes — one prompt per chunk. Falls back to repeating the
+    original prompt across all chunks if the splitter errors or returns
+    something un-parseable. Cheap call (~1¢) compared to Veo (~$1+ per chunk).
+    """
+    import json as _json
+
+    splitter_model = cfg.get("DEFAULT_TEXT_MODEL", "").strip() or "gemini-flash"
+    chunk_layout = ", ".join(f"scene {i+1}: {s}s" for i, s in enumerate(chunk_secs))
+    splitter_prompt = (
+        f"Break this video generation request into exactly {n} continuous scenes "
+        f"that visually flow into each other. The chunks will be stitched together, "
+        f"with each scene seeded from the LAST FRAME of the previous one — so scene "
+        f"N+1 must look like it could plausibly start exactly where scene N ended. "
+        f"Scene layout: {chunk_layout}. "
+        f"Output ONLY a JSON array of {n} strings — no markdown, no fences, no "
+        f"explanation, no surrounding prose. Each string is a self-contained Veo "
+        f"prompt describing what happens in that scene's window.\n\n"
+        f"Request: {overall_prompt}"
+    )
+    try:
+        raw = await call_chat(
+            cfg, prompt=splitter_prompt, model=splitter_model,
+            system="You are a video director planning continuous scene transitions. Reply with valid JSON only.",
+        )
+        # Strip common LLM noise: markdown fences, leading/trailing prose.
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            # Drop possible "json\n" language hint
+            if text.lower().startswith("json"):
+                text = text[4:].lstrip()
+            text = text.rstrip("`").strip()
+        # Find the first '[' and last ']' to be forgiving.
+        lo, hi = text.find("["), text.rfind("]")
+        if lo >= 0 and hi > lo:
+            text = text[lo : hi + 1]
+        scenes = _json.loads(text)
+        if isinstance(scenes, list) and len(scenes) == n and all(isinstance(s, str) and s.strip() for s in scenes):
+            return [s.strip() for s in scenes]
+    except Exception:
+        pass
+    # Fallback: same prompt across all chunks. Boring but functional.
+    return [overall_prompt] * n
+
+
 async def call_video(
     cfg: dict[str, str],
     *,
@@ -382,6 +435,8 @@ async def call_video(
     aspect_ratio: str | None,
     raw: bool,
     reference_image: str | None = None,
+    scene_prompts: list[str] | None = None,
+    auto_scene_split: bool = True,
 ) -> dict[str, Any]:
     """Generate a video clip. Two regimes:
 
@@ -441,6 +496,24 @@ async def call_video(
             chunk_sizes.append(VEO_CHUNK_MIN)
             remaining = 0  # tolerates a slight overshoot
 
+    n_chunks = len(chunk_sizes)
+
+    # Per-chunk prompts: caller-supplied wins, then auto-split, then same prompt.
+    if scene_prompts is not None:
+        if len(scene_prompts) != n_chunks:
+            raise RuntimeError(
+                f"scene_prompts has {len(scene_prompts)} entries but duration_sec={total} "
+                f"plans as {n_chunks} chunks ({chunk_sizes}). Pass exactly {n_chunks} prompts, "
+                f"omit scene_prompts to let the server auto-split, or set auto_scene_split=False "
+                f"to repeat the main prompt across chunks."
+            )
+        chunk_prompts = [_brand_prefix(cfg, raw) + p for p in scene_prompts]
+    elif auto_scene_split:
+        auto = await _auto_split_scenes(cfg, overall_prompt=prompt, n=n_chunks, chunk_secs=chunk_sizes)
+        chunk_prompts = [_brand_prefix(cfg, raw) + p for p in auto]
+    else:
+        chunk_prompts = [full_prompt] * n_chunks
+
     chunk_paths: list[Path] = []
     tmpdir = Path(tempfile.mkdtemp(prefix="veltria-genmedia-"))
     try:
@@ -450,14 +523,14 @@ async def call_video(
                 deadline = time.time() + job_timeout
                 mp4 = await _gen_one_video_chunk(
                     client, base=base, headers=headers,
-                    model=model, prompt=full_prompt, seconds=sec, size=size,
+                    model=model, prompt=chunk_prompts[i], seconds=sec, size=size,
                     reference_image_uri=current_ref, deadline=deadline,
                 )
                 chunk_path = tmpdir / f"chunk-{i:02d}.mp4"
                 chunk_path.write_bytes(mp4)
                 chunk_paths.append(chunk_path)
                 # Seed the NEXT chunk with this one's last frame.
-                if i + 1 < len(chunk_sizes):
+                if i + 1 < n_chunks:
                     frame_path = tmpdir / f"seed-{i+1:02d}.png"
                     _extract_last_frame(chunk_path, frame_path)
                     current_ref = _load_reference(str(frame_path))
@@ -468,7 +541,12 @@ async def call_video(
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    return {"_video_bytes": bytes_out, "_seconds": sum(chunk_sizes), "_chunks": len(chunk_sizes)}
+    return {
+        "_video_bytes": bytes_out,
+        "_seconds": sum(chunk_sizes),
+        "_chunks": n_chunks,
+        "_chunk_prompts": chunk_prompts,
+    }
 
 
 async def call_chat(cfg: dict[str, str], *, prompt: str, model: str, system: str | None) -> str:
@@ -588,39 +666,62 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="gen_video",
             description=(
-                "Generate a video clip via your gateway. Async flow under the "
-                "hood: POSTs the job, polls until ready, fetches the MP4. "
-                "Model names must match what your gateway exposes ('veo-3', "
-                "'veo-2', 'sora-2', 'runway-gen3'). "
-                "Veo caps each generation at 8 seconds; longer durations are "
-                "automatically chained as extensions (8-sec increments), so "
-                "duration_sec=24 = 1 base + 2 extensions. Each chained chunk "
-                "is a separate Veo call that costs ~$0.10–0.35/sec, so a "
-                "30-sec clip can easily be $5–10 — use thoughtfully. "
-                "Pass `reference_image` to animate a still photo "
-                "(image-to-video / first-frame conditioning). "
-                "Each generation takes 30–90 seconds; multi-chunk clips "
-                "multiply that. Patient mode."
+                "Generate a video clip via your gateway. Async flow: POST the "
+                "job, poll until ready, fetch the MP4. Model names must match "
+                "what your gateway exposes ('veo-3', 'veo-2', 'sora-2', "
+                "'runway-gen3'). "
+                "Veo caps each generation at 8 seconds. For longer clips the "
+                "server chains 8-sec chunks client-side, seeding each new "
+                "chunk with the previous chunk's last frame (via ffmpeg) and "
+                "concatenating the final MP4 — so a 24-sec request runs as "
+                "three back-to-back Veo calls with visual continuity at every "
+                "join. Hard cap 60 sec. Each chunk is a billable Veo call "
+                "(~$0.10–0.35/sec), so a 30-sec clip is ~4× the cost of an "
+                "8-sec clip. "
+                "Per-chunk scene control: by default, when duration_sec > 8, "
+                "the server asks the gateway's text model to break your prompt "
+                "into N continuous scenes (one per chunk) for narrative flow. "
+                "Override with explicit `scene_prompts` (list of N strings, "
+                "one per chunk) for full control, or set "
+                "`auto_scene_split=false` to repeat the same prompt across "
+                "all chunks. "
+                "Pass `reference_image` to animate a still photo (image-to-"
+                "video / first-frame conditioning). "
+                "Each chunk takes 30–90 sec; long clips multiply that — "
+                "expect 3–8 min wall-clock for a 24-sec clip. Patient mode."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string"},
+                    "prompt": {
+                        "type": "string",
+                        "description": "The overall video request. For clips ≤8s this is sent directly to Veo. For longer clips it's used as a directive for the scene-splitter unless you also pass scene_prompts.",
+                    },
                     "model": {"type": "string", "description": "Model name as configured on your gateway"},
                     "duration_sec": {
                         "type": "integer",
-                        "description": "Target clip length in seconds. Clamped to 5–60. Veo's per-call max is 8s; longer values are chained via /v1/videos/extensions (8-sec chunks).",
+                        "description": "Target clip length in seconds. Clamped to 5–60. Clips > 8s are auto-chained as 8-sec chunks.",
                         "default": 5,
                         "minimum": 5,
                         "maximum": 60,
                     },
                     "aspect_ratio": {
                         "type": "string",
-                        "description": "Convenience aspect: '16:9', '9:16', '1:1', '4:3', '3:4' — auto-converted to size. You can also pass a raw 'WxH' (e.g. '1280x720') and it's used as-is.",
+                        "description": "Convenience aspect: '16:9', '9:16', '1:1', '4:3', '3:4' — auto-converted to size. Or pass raw 'WxH' (e.g. '1280x720').",
                     },
                     "reference_image": {
                         "type": "string",
-                        "description": "Optional first-frame seed. File path on disk, http(s):// URL, or data: URI. Used for image-to-video animation.",
+                        "description": "Optional first-frame seed for the FIRST chunk. File path, http(s):// URL, or data: URI. Subsequent chunks always seed from the previous chunk's last frame.",
+                    },
+                    "scene_prompts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional per-chunk prompts for narrative reels. Length must equal the chunk count derived from duration_sec (one prompt per 8-sec chunk; final chunk may be 5–7s). When given, takes precedence over the main prompt for chunk generation. Use when you want explicit scene direction (e.g. ['product on white', 'zoom out to kitchen', 'hand lifts mug']).",
+                    },
+                    "auto_scene_split": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When duration_sec > 8 and scene_prompts is not given, asks the gateway's text model to break the main prompt into N continuous scenes for narrative flow. Set false to repeat the same prompt across all chunks (continuous visual, no narrative).",
                     },
                     "output_dir": {"type": "string"},
                     "raw": {"type": "boolean", "default": False},
@@ -682,6 +783,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"✅ Generated {len(paths)} image(s) in {dur:.1f}s:\n" + "\n".join(paths))]
 
     if name == "gen_video":
+        scene_prompts = arguments.get("scene_prompts")
+        if scene_prompts is not None and not isinstance(scene_prompts, list):
+            return [TextContent(type="text", text="❌ scene_prompts must be an array of strings")]
         try:
             result = await call_video(
                 cfg,
@@ -691,6 +795,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 aspect_ratio=arguments.get("aspect_ratio"),
                 raw=bool(arguments.get("raw", False)),
                 reference_image=arguments.get("reference_image"),
+                scene_prompts=scene_prompts,
+                auto_scene_split=bool(arguments.get("auto_scene_split", True)),
             )
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"❌ Gateway error {e.response.status_code}: {e.response.text[:500]}")]
@@ -700,7 +806,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if not paths:
             return [TextContent(type="text", text="⚠️ Gateway returned no video data. Full response:\n" + str(result)[:1500])]
         dur = time.time() - started
-        return [TextContent(type="text", text=f"✅ Generated {len(paths)} video(s) in {dur:.1f}s:\n" + "\n".join(paths))]
+        msg = f"✅ Generated {len(paths)} video(s) in {dur:.1f}s ({result.get('_seconds')}s, {result.get('_chunks')} chunk(s)):\n" + "\n".join(paths)
+        chunk_prompts = result.get("_chunk_prompts")
+        if chunk_prompts and len(chunk_prompts) > 1:
+            msg += "\n\nScenes used:\n" + "\n".join(f"  {i+1}. {p}" for i, p in enumerate(chunk_prompts))
+        return [TextContent(type="text", text=msg)]
 
     if name == "gen_text":
         try:
