@@ -60,17 +60,6 @@ prompt_secret() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-flight
 # ─────────────────────────────────────────────────────────────────────────────
-
-# When invoked via `curl | bash`, our stdin is the curl pipe, not the terminal.
-# That breaks `read` prompts and (more importantly) Homebrew's own installer,
-# which refuses to run when stdin isn't a TTY. Reconnect to the user's terminal
-# so the wizard, sudo prompts, and any nested installers can read input.
-# Be defensive: in CI / sandboxed environments there's no controlling TTY,
-# and opening /dev/tty would fail with ENXIO.
-if [ ! -t 0 ] && [ -c /dev/tty ] && ( exec </dev/tty ) 2>/dev/null; then
-  exec </dev/tty
-fi
-
 banner
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,16 +233,17 @@ bootstrap_prereqs() {
   ok "Prerequisites installed and verified"
 }
 
-# Detect --headless early so bootstrap_prereqs knows whether to prompt
+# Detect --headless early
 HEADLESS=0
 [ "${1:-}" = "--headless" ] && HEADLESS=1
 
-bootstrap_prereqs
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Bootstrap — when run via `curl | bash`, BASH_SOURCE is /dev/fd/N and the
-# repo isn't on disk yet. Detect that and clone first, then re-exec from
-# the clone so the rest of the script can use relative paths normally.
+# Bootstrap — when run via `curl | bash`, bash is reading THIS SCRIPT from
+# its own stdin (the curl pipe). We can't do any stdin redirection here
+# without bash starting to read commands interactively from the terminal,
+# which looks like a hang. So: clone the repo and exec from the on-disk
+# copy first. After exec, bash is reading from a real file and everything
+# else (including the tty reattach below) is safe.
 # ─────────────────────────────────────────────────────────────────────────────
 REPO_URL="${GENMEDIA_REPO_URL:-https://github.com/VeltriaAI/veltria-genmedia.git}"
 REPO_BRANCH="${GENMEDIA_REPO_BRANCH:-main}"
@@ -264,7 +254,10 @@ SCRIPT_DIR_RAW="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd || echo "")"
 
 if [ -z "$SCRIPT_DIR_RAW" ] || [ ! -f "$SCRIPT_DIR_RAW/../mcp/server.py" ]; then
   say "Bootstrap — cloning $REPO_URL → $INSTALL_DIR"
-  command -v git >/dev/null 2>&1 || { err "git not found. Install git first."; exit 1; }
+  if ! command -v git >/dev/null 2>&1; then
+    err "git not found. Install it first (macOS: \`xcode-select --install\`; Ubuntu: \`sudo apt install git\`), then re-run."
+    exit 1
+  fi
   if [ -d "$INSTALL_DIR/.git" ]; then
     git -C "$INSTALL_DIR" fetch --quiet origin "$REPO_BRANCH"
     git -C "$INSTALL_DIR" checkout --quiet "$REPO_BRANCH"
@@ -282,6 +275,19 @@ fi
 SCRIPT_DIR="$SCRIPT_DIR_RAW"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 say "Running from: $REPO_ROOT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reattach stdin to the controlling terminal — needed because bash inherits
+# whatever stdin it was launched with (curl pipe, file, etc.) and the wizard
+# wants to read interactively. Safe to do now: bash is reading the script
+# from a real file on disk, not from stdin, so redirecting stdin doesn't
+# touch the script source. Defensive against CI / sandboxes with no TTY.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ ! -t 0 ] && [ -c /dev/tty ] && ( exec </dev/tty ) 2>/dev/null; then
+  exec </dev/tty
+fi
+
+bootstrap_prereqs
 
 PYV=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 ok "Using Python $PYV at $PYTHON_BIN"
