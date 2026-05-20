@@ -245,6 +245,57 @@ def _push_image_url(out: list[dict[str, str]], url: str) -> None:
         out.append({"url": url})
 
 
+# Veo single-shot generation tops out at 8 seconds. For longer clips we chain
+# via /v1/videos/extensions, each extension adding up to 8 more sec onto the
+# previous video. So a 24-sec ask = 1 base (8) + 2 extensions (8 each).
+VEO_CHUNK_MAX = 8
+VEO_CHUNK_MIN = 5  # Veo rejects < 5 sec per chunk
+
+
+def _aspect_to_size(aspect_ratio: str | None) -> str | None:
+    """Map common aspect ratios to a 'WxH' pixel size string. Pass-through if
+    the input already looks like 'WxH'."""
+    if not aspect_ratio:
+        return None
+    if "x" in aspect_ratio.lower() and aspect_ratio.lower().replace("x", "").isdigit():
+        return aspect_ratio
+    return {
+        "16:9": "1280x720",
+        "9:16": "720x1280",
+        "1:1":  "1024x1024",
+        "4:3":  "1024x768",
+        "3:4":  "768x1024",
+    }.get(aspect_ratio.strip(), None)
+
+
+async def _poll_video_job(
+    client: httpx.AsyncClient,
+    *,
+    base: str,
+    headers: dict[str, str],
+    job_id: str,
+    deadline: float,
+) -> dict[str, Any]:
+    """Block until the gateway reports completed/failed. Veo jobs typically take
+    30-90s for an 8-sec clip; back off from 5s to 15s so we don't hammer."""
+    backoff = 5
+    while time.time() < deadline:
+        r = await client.get(f"{base}/v1/videos/{job_id}", headers=headers)
+        r.raise_for_status()
+        d = r.json()
+        status = d.get("status")
+        if status == "completed":
+            return d
+        if status == "failed":
+            err = d.get("error") or {}
+            raise RuntimeError(
+                f"Video job failed: {err.get('message') or err}"
+            )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff + 2, 15)
+    raise RuntimeError(f"Video job {job_id} timed out (raise VIDEO_TIMEOUT in gateway.env)")
+
+
 async def call_video(
     cfg: dict[str, str],
     *,
@@ -255,24 +306,78 @@ async def call_video(
     raw: bool,
     reference_image: str | None = None,
 ) -> dict[str, Any]:
-    """Text-to-video by default. If reference_image is given, attaches it as
-    the first-frame seed (Veo-style image-to-video conditioning).
+    """Async Veo flow:
+
+      1. POST /v1/videos              → returns a job (status: processing)
+      2. GET  /v1/videos/{id}         → poll until status: completed/failed
+      3. If duration > 8s, chain:
+         POST /v1/videos/extensions   → new job extending the prior one
+         (poll again, repeat until target duration reached)
+      4. GET  /v1/videos/{id}/content → MP4 bytes
+
+    Returns {'_video_bytes': bytes, '_video_id': str, '_seconds': int}.
+    The bytes are saved to disk by save_video_result().
     """
-    payload: dict[str, Any] = {
+    full_prompt = _brand_prefix(cfg, raw) + prompt
+    headers = _headers(cfg)
+    base = cfg["GATEWAY_BASE_URL"].rstrip("/")
+    job_timeout = int(cfg.get("VIDEO_TIMEOUT", "600"))
+    deadline = time.time() + job_timeout
+
+    # Clamp: Veo refuses <5s per chunk; cap the overall ask to keep runaway
+    # extension chains from blowing budget by accident.
+    total = max(VEO_CHUNK_MIN, min(int(duration_sec), 60))
+
+    # Plan: first chunk up to 8s, then 8s extensions until we hit the target.
+    first_chunk = min(total, VEO_CHUNK_MAX)
+    remaining = total - first_chunk
+
+    size = _aspect_to_size(aspect_ratio)
+
+    # 1. Initial generation
+    init_payload: dict[str, Any] = {
         "model": model,
-        "prompt": _brand_prefix(cfg, raw) + prompt,
-        "duration_seconds": duration_sec,
+        "prompt": full_prompt,
+        "seconds": first_chunk,
     }
-    if aspect_ratio:
-        payload["aspect_ratio"] = aspect_ratio
+    if size:
+        init_payload["size"] = size
     if reference_image:
-        payload["image"] = _load_reference(reference_image)
-    timeout = int(cfg.get("VIDEO_TIMEOUT", "600"))
-    url = cfg["GATEWAY_BASE_URL"].rstrip("/") + "/v1/video/generations"
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, json=payload, headers=_headers(cfg))
-    resp.raise_for_status()
-    return resp.json()
+        # OpenAI Sora-style field name; LiteLLM maps it to Vertex's image-to-
+        # video input for Veo.
+        init_payload["input_reference"] = _load_reference(reference_image)
+
+    async with httpx.AsyncClient(timeout=job_timeout) as client:
+        resp = await client.post(f"{base}/v1/videos", json=init_payload, headers=headers)
+        resp.raise_for_status()
+        job = resp.json()
+        video_id = job["id"]
+        await _poll_video_job(client, base=base, headers=headers, job_id=video_id, deadline=deadline)
+
+        # 2. Extensions (only if user asked for > 8s)
+        while remaining > 0:
+            chunk = min(VEO_CHUNK_MAX, max(VEO_CHUNK_MIN, remaining))
+            ext_payload = {
+                "model": model,
+                "prompt": full_prompt,
+                "seconds": chunk,
+                "video": {"id": video_id},
+            }
+            er = await client.post(f"{base}/v1/videos/extensions", json=ext_payload, headers=headers)
+            er.raise_for_status()
+            video_id = er.json()["id"]
+            await _poll_video_job(client, base=base, headers=headers, job_id=video_id, deadline=deadline)
+            remaining -= chunk
+
+        # 3. Fetch the bytes
+        cr = await client.get(f"{base}/v1/videos/{video_id}/content", headers=headers)
+        cr.raise_for_status()
+
+    return {
+        "_video_bytes": cr.content,
+        "_video_id": video_id,
+        "_seconds": total,
+    }
 
 
 async def call_chat(cfg: dict[str, str], *, prompt: str, model: str, system: str | None) -> str:
@@ -319,14 +424,26 @@ def save_image_result(cfg: dict[str, str], *, result: dict[str, Any], prompt: st
 
 
 def save_video_result(cfg: dict[str, str], *, result: dict[str, Any], prompt: str, output_dir: str | None) -> list[str]:
+    """call_video returns one of two shapes:
+
+      - {'_video_bytes': <bytes>, ...}             (new — async Veo flow, content already fetched)
+      - {'data': [{'url': ...}, ...]}              (legacy — kept for gateways that
+                                                    return a direct URL)
+    """
     paths: list[str] = []
     outdir = _outdir(cfg, "video", output_dir)
     slug = _slug(prompt)
     stamp = _stamp()
+
+    if "_video_bytes" in result:
+        out = outdir / f"{stamp}-{slug}.mp4"
+        out.write_bytes(result["_video_bytes"])
+        paths.append(str(out))
+        return paths
+
     for i, item in enumerate(result.get("data", [])):
         suffix = "" if i == 0 else f"-{i}"
-        fname = f"{stamp}-{slug}{suffix}.mp4"
-        out = outdir / fname
+        out = outdir / f"{stamp}-{slug}{suffix}.mp4"
         url = item.get("url") or item.get("video_url")
         if not url:
             continue
@@ -380,19 +497,36 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="gen_video",
             description=(
-                "Generate a short video clip via your gateway. Model names must "
-                "match what your gateway exposes (e.g. 'veo-3', 'veo-2', "
-                "'sora-2', 'runway-gen3'). Pass `reference_image` to animate a "
-                "still photo (image-to-video / first-frame conditioning). "
-                "Videos are expensive — use thoughtfully."
+                "Generate a video clip via your gateway. Async flow under the "
+                "hood: POSTs the job, polls until ready, fetches the MP4. "
+                "Model names must match what your gateway exposes ('veo-3', "
+                "'veo-2', 'sora-2', 'runway-gen3'). "
+                "Veo caps each generation at 8 seconds; longer durations are "
+                "automatically chained as extensions (8-sec increments), so "
+                "duration_sec=24 = 1 base + 2 extensions. Each chained chunk "
+                "is a separate Veo call that costs ~$0.10–0.35/sec, so a "
+                "30-sec clip can easily be $5–10 — use thoughtfully. "
+                "Pass `reference_image` to animate a still photo "
+                "(image-to-video / first-frame conditioning). "
+                "Each generation takes 30–90 seconds; multi-chunk clips "
+                "multiply that. Patient mode."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string"},
                     "model": {"type": "string", "description": "Model name as configured on your gateway"},
-                    "duration_sec": {"type": "integer", "description": "Clip length", "default": 5, "minimum": 1, "maximum": 30},
-                    "aspect_ratio": {"type": "string", "description": "e.g. 16:9, 9:16, 1:1"},
+                    "duration_sec": {
+                        "type": "integer",
+                        "description": "Target clip length in seconds. Clamped to 5–60. Veo's per-call max is 8s; longer values are chained via /v1/videos/extensions (8-sec chunks).",
+                        "default": 5,
+                        "minimum": 5,
+                        "maximum": 60,
+                    },
+                    "aspect_ratio": {
+                        "type": "string",
+                        "description": "Convenience aspect: '16:9', '9:16', '1:1', '4:3', '3:4' — auto-converted to size. You can also pass a raw 'WxH' (e.g. '1280x720') and it's used as-is.",
+                    },
                     "reference_image": {
                         "type": "string",
                         "description": "Optional first-frame seed. File path on disk, http(s):// URL, or data: URI. Used for image-to-video animation.",
