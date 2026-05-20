@@ -299,47 +299,100 @@ ok "Using Python $PYV at $PYTHON_BIN"
 # ─────────────────────────────────────────────────────────────────────────────
 # Inputs (interactive or headless)  — HEADLESS already set above
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Detect previous answers so re-runs default to "keep what you had"
+# ─────────────────────────────────────────────────────────────────────────────
+PREV_CFG="$HOME/.config/veltria-genmedia/gateway.env"
+
+# Read a single key=value from a sourced-style env file (no exec, just grep+cut).
+get_cfg() {
+  local key="$1" file="${2:-$PREV_CFG}"
+  [ -f "$file" ] || return 0
+  grep -E "^${key}=" "$file" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+prev_url=$(get_cfg GATEWAY_BASE_URL)
+prev_image_dir=$(get_cfg DEFAULT_IMAGE_OUTPUT_DIR)
+prev_video_dir=$(get_cfg DEFAULT_VIDEO_OUTPUT_DIR)
+prev_brand=$(get_cfg BRAND_PRESET)
+prev_key_set=0
+[ -n "$(get_cfg GATEWAY_API_KEY)" ] && prev_key_set=1
+
+# Figure out which Claude clients already have us wired so we default to the
+# same answer next time. (Desktop has a different config dir on macOS vs Linux.)
+DESKTOP_CFG_MAC="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+DESKTOP_CFG_LIN="$HOME/.config/Claude/claude_desktop_config.json"
+CODE_CFG="$HOME/.claude.json"
+prev_desktop_wired=0
+prev_code_wired=0
+for c in "$DESKTOP_CFG_MAC" "$DESKTOP_CFG_LIN"; do
+  [ -f "$c" ] && jq -e '.mcpServers."veltria-genmedia"' "$c" >/dev/null 2>&1 && prev_desktop_wired=1
+done
+[ -f "$CODE_CFG" ] && jq -e '.mcpServers."veltria-genmedia"' "$CODE_CFG" >/dev/null 2>&1 && prev_code_wired=1
+if   [ "$prev_desktop_wired" = "1" ] && [ "$prev_code_wired" = "1" ]; then prev_client="both"
+elif [ "$prev_desktop_wired" = "1" ]; then prev_client="desktop"
+elif [ "$prev_code_wired"    = "1" ]; then prev_client="code"
+else prev_client="both"
+fi
+
+# Per-field defaults (cli env > previous config > shipped default).
+def_url="${GENMEDIA_GATEWAY_URL:-$prev_url}"
+def_client="${GENMEDIA_CLIENT:-$prev_client}"
+def_image_dir="${GENMEDIA_IMAGE_DIR:-${prev_image_dir:-$HOME/Pictures/genmedia}}"
+def_video_dir="${GENMEDIA_VIDEO_DIR:-${prev_video_dir:-$HOME/Movies/genmedia}}"
+def_brand="${GENMEDIA_BRAND_PRESET:-$prev_brand}"
+
 if [ "$HEADLESS" = "1" ]; then
-  GATEWAY_URL="${GENMEDIA_GATEWAY_URL:-}"
-  API_KEY="${GENMEDIA_API_KEY:-}"
-  CLIENT="${GENMEDIA_CLIENT:-both}"
-  IMAGE_DIR="${GENMEDIA_IMAGE_DIR:-$HOME/Pictures/genmedia}"
-  VIDEO_DIR="${GENMEDIA_VIDEO_DIR:-$HOME/Movies/genmedia}"
-  BRAND_PRESET="${GENMEDIA_BRAND_PRESET:-}"
+  GATEWAY_URL="$def_url"
+  API_KEY="${GENMEDIA_API_KEY:-$(get_cfg GATEWAY_API_KEY)}"
+  CLIENT="$def_client"
+  IMAGE_DIR="$def_image_dir"
+  VIDEO_DIR="$def_video_dir"
+  BRAND_PRESET="$def_brand"
   if [ -z "$GATEWAY_URL" ] || [ -z "$API_KEY" ]; then
-    err "--headless requires GENMEDIA_GATEWAY_URL and GENMEDIA_API_KEY env vars"
+    err "--headless requires GENMEDIA_GATEWAY_URL and GENMEDIA_API_KEY (or a previous config to reuse)"
     exit 1
   fi
 else
   echo
-  say "I'll ask a few questions. Defaults in brackets — press Enter to accept."
+  if [ -f "$PREV_CFG" ]; then
+    say "Found existing config at $PREV_CFG — re-using previous answers as defaults."
+    say "Press Enter to keep, or type a new value to override."
+  else
+    say "I'll ask a few questions. Defaults in brackets — press Enter to accept."
+  fi
   echo
 
-  GATEWAY_URL=$(prompt "Gateway base URL (e.g. https://your-gateway.example.com)" "")
+  GATEWAY_URL=$(prompt "Gateway base URL (e.g. https://your-gateway.example.com)" "$def_url")
   if [ -z "$GATEWAY_URL" ]; then
     err "Gateway URL is required. Get it from your gateway admin and re-run."
     exit 1
   fi
 
-  API_KEY=$(prompt_secret "Virtual API key (will not echo):")
+  if [ "$prev_key_set" = "1" ]; then
+    API_KEY=$(prompt_secret "Virtual API key (Enter to keep existing, paste new to rotate):")
+    [ -z "$API_KEY" ] && API_KEY=$(get_cfg GATEWAY_API_KEY)
+  else
+    API_KEY=$(prompt_secret "Virtual API key (will not echo):")
+  fi
   if [ -z "$API_KEY" ]; then
-    err "No key entered. Get one from your gateway admin and re-run."
+    err "No key. Get one from your gateway admin and re-run."
     exit 1
   fi
 
   echo
-  CLIENT=$(prompt "Wire which Claude client? (desktop / code / both)" "both")
+  CLIENT=$(prompt "Wire which Claude client? (desktop / code / both)" "$def_client")
   case "$CLIENT" in
     desktop|code|both) ;;
     *) err "Unknown client '$CLIENT'. Must be desktop / code / both."; exit 1 ;;
   esac
 
   echo
-  IMAGE_DIR=$(prompt "Save generated images to" "$HOME/Pictures/genmedia")
-  VIDEO_DIR=$(prompt "Save generated videos to" "$HOME/Movies/genmedia")
+  IMAGE_DIR=$(prompt "Save generated images to" "$def_image_dir")
+  VIDEO_DIR=$(prompt "Save generated videos to" "$def_video_dir")
 
   echo
-  BRAND_PRESET=$(prompt "Brand preset (free-form, prepended to every image prompt — Enter to skip)" "")
+  BRAND_PRESET=$(prompt "Brand preset (free-form, prepended to every image prompt — Enter to skip)" "$def_brand")
 fi
 
 # Normalize gateway URL — strip trailing slash
