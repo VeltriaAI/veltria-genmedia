@@ -1,0 +1,26 @@
+[project]
+name = "veltria-genmedia-mcp"
+version = "0.1.0"
+description = "MCP server proxying image/video/text generation through any OpenAI-compatible gateway"
+authors = [{ name = "Veltria AI" }]
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "mcp>=1.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/VeltriaAI/veltria-genmedia"
+Issues = "https://github.com/VeltriaAI/veltria-genmedia/issues"
+
+[project.scripts]
+veltria-genmedia-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]

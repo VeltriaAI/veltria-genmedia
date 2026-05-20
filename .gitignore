@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Local test outputs — never commit generated media
+outputs/
+test-outputs/
+genmedia-test/
+*.mp4
+*.mov
+*.webp
+# (intentionally NOT excluding .png/.jpg in case we add screenshots in docs/)
+
+# Allow doc screenshots explicitly
+!docs/screenshots/*.png
+!docs/screenshots/*.jpg
+
+# Secrets — NEVER commit
+.env
+.env.*
+gateway.env
+*.api-key
+service-account*.json
+credentials.json
+
+# Logs
+*.log
+/tmp/genmedia-verify*
