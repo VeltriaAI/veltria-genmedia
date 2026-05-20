@@ -54,7 +54,20 @@ gen_video(
 )
 ```
 
-When `reference_images` is set, `gen_image` routes via `/v1/chat/completions` with multimodal content blocks (the shape Gemini 2.5/3, GPT-4o, and Claude understand). Without references it uses `/v1/images/generations` as before. `gen_video` always uses `/v1/video/generations`; the reference image is passed as the first-frame seed.
+When `reference_images` is set, `gen_image` routes via `/v1/chat/completions` with multimodal content blocks (the shape Gemini 2.5/3, GPT-4o, and Claude understand). Without references it uses `/v1/images/generations` as before. `gen_video` uses `/v1/videos` (async — server POSTs the job, polls until ready, then fetches the MP4); `reference_image` is forwarded as `input_reference` for first-frame conditioning.
+
+### Long videos (>8 seconds)
+
+Veo's per-call max is **8 seconds**. The server transparently chains longer requests client-side:
+
+1. Generate base 8-sec clip
+2. Extract its last frame with `ffmpeg`
+3. Use that frame as `input_reference` for the next 8-sec clip
+4. Concatenate all chunks via `ffmpeg` stream-copy (no re-encode)
+
+A `duration_sec=24` request runs as three 8-sec Veo calls back-to-back with frame-continuity at each join, then stitches into a single MP4. Hard cap at 60 sec to prevent runaway cost. **Each chunk is a billable Veo call** — a 30-sec clip is ~4× the cost of an 8-sec clip.
+
+Requires `ffmpeg` + `ffprobe` on the user's machine (the installer adds them automatically).
 
 ---
 

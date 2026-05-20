@@ -51,7 +51,7 @@ AUTH_HEADER=authorization
 
 ## Pattern D — your own proxy
 
-Anything that accepts POST to `/v1/images/generations`, `/v1/video/generations`, `/v1/chat/completions` with a JSON body and the standard OpenAI request schema works. Roll your own with FastAPI + httpx in ~50 lines if needed.
+Anything that accepts POST to `/v1/images/generations`, `/v1/chat/completions`, and OpenAI Sora-style `/v1/videos` (async: `POST /v1/videos` → poll `GET /v1/videos/{id}` → fetch `GET /v1/videos/{id}/content`) works. The MCP server frame-chains client-side for clips >8 sec, so the gateway only needs to support single-shot video generation up to 8 sec — no extension endpoint required.
 
 ---
 
