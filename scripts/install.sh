@@ -65,7 +65,9 @@ prompt_secret() {
 # That breaks `read` prompts and (more importantly) Homebrew's own installer,
 # which refuses to run when stdin isn't a TTY. Reconnect to the user's terminal
 # so the wizard, sudo prompts, and any nested installers can read input.
-if [ ! -t 0 ] && [ -r /dev/tty ]; then
+# Be defensive: in CI / sandboxed environments there's no controlling TTY,
+# and opening /dev/tty would fail with ENXIO.
+if [ ! -t 0 ] && [ -c /dev/tty ] && ( exec </dev/tty ) 2>/dev/null; then
   exec </dev/tty
 fi
 
