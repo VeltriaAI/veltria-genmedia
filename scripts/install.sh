@@ -92,20 +92,55 @@ detect_os() {
   esac
 }
 
-python_ok() {
-  command -v python3 >/dev/null 2>&1 \
-    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null \
-    && python3 -c 'import venv' 2>/dev/null
+_python_satisfies() {
+  # $1 = python binary path/name
+  command -v "$1" >/dev/null 2>&1 \
+    && "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null \
+    && "$1" -c 'import venv' 2>/dev/null
 }
 
-prepend_brew_python() {
-  for p in /opt/homebrew/opt/python@3.12/libexec/bin \
-           /usr/local/opt/python@3.12/libexec/bin \
-           /opt/homebrew/opt/python@3.13/libexec/bin \
-           /usr/local/opt/python@3.13/libexec/bin; do
-    [ -d "$p" ] && export PATH="$p:$PATH" && return 0
+# Resolve PYTHON_BIN — the python3.X binary to use for venv + MCP server.
+# Homebrew's python@3.X is keg-only: it installs python3.X (versioned) but
+# does NOT touch /opt/homebrew/bin/python3. So `python3` alone often resolves
+# to system /usr/bin/python3 (3.9 on macOS) even when a newer brewed Python
+# is installed. Probe versioned names AND known brew prefixes.
+resolve_python_bin() {
+  # Already resolved + still valid?
+  [ -n "${PYTHON_BIN:-}" ] && _python_satisfies "$PYTHON_BIN" && return 0
+
+  # 1. plain python3 (good if it's 3.11+)
+  if _python_satisfies python3; then
+    PYTHON_BIN="$(command -v python3)"
+    return 0
+  fi
+  # 2. versioned names on PATH — try newest first
+  for v in 3.15 3.14 3.13 3.12 3.11; do
+    if _python_satisfies "python$v"; then
+      PYTHON_BIN="$(command -v "python$v")"
+      return 0
+    fi
   done
-  return 0
+  # 3. known brew keg-only locations
+  for p in /opt/homebrew/opt/python@3.15/libexec/bin/python3 \
+           /opt/homebrew/opt/python@3.14/libexec/bin/python3 \
+           /opt/homebrew/opt/python@3.13/libexec/bin/python3 \
+           /opt/homebrew/opt/python@3.12/libexec/bin/python3 \
+           /opt/homebrew/opt/python@3.11/libexec/bin/python3 \
+           /usr/local/opt/python@3.15/libexec/bin/python3 \
+           /usr/local/opt/python@3.14/libexec/bin/python3 \
+           /usr/local/opt/python@3.13/libexec/bin/python3 \
+           /usr/local/opt/python@3.12/libexec/bin/python3 \
+           /usr/local/opt/python@3.11/libexec/bin/python3; do
+    if [ -x "$p" ] && _python_satisfies "$p"; then
+      PYTHON_BIN="$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+python_ok() {
+  resolve_python_bin
 }
 
 install_prereqs_macos() {
@@ -138,7 +173,9 @@ install_prereqs_macos() {
     say "Installing via Homebrew: ${brew_pkgs[*]}"
     brew install "${brew_pkgs[@]}" || { err "brew install failed"; exit 1; }
   fi
-  prepend_brew_python
+  # re-probe after brew finished so we pick up the freshly-installed python
+  PYTHON_BIN=""
+  resolve_python_bin || true
 }
 
 install_prereqs_apt() {
@@ -246,8 +283,8 @@ SCRIPT_DIR="$SCRIPT_DIR_RAW"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 say "Running from: $REPO_ROOT"
 
-PYV=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-ok "Using Python $PYV at $(command -v python3)"
+PYV=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+ok "Using Python $PYV at $PYTHON_BIN"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Inputs (interactive or headless)  — HEADLESS already set above
@@ -311,7 +348,7 @@ VENV_DIR="$REPO_ROOT/.venv"
 VENV_PY="$VENV_DIR/bin/python"
 
 if [ ! -x "$VENV_PY" ]; then
-  python3 -m venv "$VENV_DIR" || {
+  "$PYTHON_BIN" -m venv "$VENV_DIR" || {
     err "Failed to create venv at $VENV_DIR."
     err "On Debian/Ubuntu you may need:  sudo apt install python3-venv"
     exit 1
