@@ -159,6 +159,7 @@ install_prereqs_macos() {
       jq)   brew_pkgs+=(jq) ;;
       git)  brew_pkgs+=(git) ;;
       ffmpeg) brew_pkgs+=(ffmpeg) ;;
+      pngpaste) brew_pkgs+=(pngpaste) ;;   # for 'clipboard' magic reference input
       python3) brew_pkgs+=(python@3.12) ;;
     esac
   done
@@ -214,6 +215,11 @@ bootstrap_prereqs() {
   command -v jq     >/dev/null 2>&1 || missing+=("jq")
   command -v git    >/dev/null 2>&1 || missing+=("git")
   command -v ffmpeg >/dev/null 2>&1 || missing+=("ffmpeg")
+  # pngpaste is macOS-only (for the 'clipboard' reference input). Don't probe
+  # on Linux — feature is gracefully unavailable there.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    command -v pngpaste >/dev/null 2>&1 || missing+=("pngpaste")
+  fi
   python_ok                         || missing+=("python3")
 
   [ ${#missing[@]} -eq 0 ] && { ok "Prerequisites OK"; return 0; }
@@ -233,6 +239,9 @@ bootstrap_prereqs() {
   command -v jq     >/dev/null 2>&1 || still_missing+=("jq")
   command -v git    >/dev/null 2>&1 || still_missing+=("git")
   command -v ffmpeg >/dev/null 2>&1 || still_missing+=("ffmpeg")
+  if [ "$(uname -s)" = "Darwin" ]; then
+    command -v pngpaste >/dev/null 2>&1 || still_missing+=("pngpaste")
+  fi
   python_ok                         || still_missing+=("python3 (3.11+ with venv)")
   if [ ${#still_missing[@]} -gt 0 ]; then
     err "After install attempt, still missing: ${still_missing[*]}"
