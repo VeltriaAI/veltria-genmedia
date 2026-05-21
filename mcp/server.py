@@ -117,6 +117,33 @@ def _guess_mime(p: Path) -> str:
     }.get(p.suffix.lower(), "application/octet-stream")
 
 
+def _clipboard_to_data_uri() -> str:
+    """Read the current clipboard image and return it as a data: URI.
+
+    Uses pngpaste (macOS) to grab whatever image is on the clipboard.
+    Raises RuntimeError if pngpaste is not installed or clipboard has no image.
+    """
+    pngpaste = shutil.which("pngpaste")
+    if not pngpaste:
+        raise RuntimeError(
+            "pngpaste is required to use 'clipboard' as a reference image.\n"
+            "Install it with:  brew install pngpaste"
+        )
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        result = subprocess.run([pngpaste, str(tmp)], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"No image found on clipboard (pngpaste said: {result.stderr.strip() or 'no output'}). "
+                "Copy an image first (Cmd+C), then retry."
+            )
+        b64 = base64.b64encode(tmp.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _load_reference(path_or_url: str) -> str:
     """Resolve a reference input to a data: URI / passthrough URL.
 
@@ -124,16 +151,19 @@ def _load_reference(path_or_url: str) -> str:
     compatible gateways accept data: URIs in image_url content blocks.
 
     Accepts:
+      - "clipboard"     → reads current clipboard image via pngpaste (macOS)
       - http(s):// URLs → returned as-is
       - data:... URIs   → returned as-is
       - local file paths → read bytes, base64-encode → data: URI
     """
     s = path_or_url.strip()
+    if s.lower() == "clipboard":
+        return _clipboard_to_data_uri()
     if s.startswith(("http://", "https://", "data:")):
         return s
     p = Path(_expand(s))
     if not p.is_file():
-        raise RuntimeError(f"Reference not found at {p} (give an absolute path, http(s):// URL, or data: URI)")
+        raise RuntimeError(f"Reference not found at {p} (give an absolute path, http(s):// URL, data: URI, or 'clipboard')")
     b64 = base64.b64encode(p.read_bytes()).decode("ascii")
     return f"data:{_guess_mime(p)};base64,{b64}"
 
@@ -145,12 +175,19 @@ def _load_reference_for_veo(path_or_url: str) -> dict[str, str]:
     GCS URI or an inline base64 dict. LiteLLM mirrors that constraint at the
     /v1/videos endpoint. Accepted shapes:
 
+      - "clipboard"                       → reads clipboard image via pngpaste
       - gs://bucket/path                  → {"gcsUri": "gs://..."}
       - http(s):// URL                    → fetch bytes ourselves, then b64
       - data:image/...;base64,...         → split, return dict
       - local file path                   → read bytes, b64-encode
     """
     s = path_or_url.strip()
+    if s.lower() == "clipboard":
+        data_uri = _clipboard_to_data_uri()
+        # Convert the data: URI we just built into the Veo dict shape.
+        head, payload = data_uri.split(",", 1)
+        mime = head.split(":", 1)[1].split(";", 1)[0]
+        return {"bytesBase64Encoded": payload, "mimeType": mime}
     if s.startswith("gs://"):
         return {"gcsUri": s}
 
@@ -700,7 +737,7 @@ async def list_tools() -> list[Tool]:
                     "reference_images": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of reference inputs. Each entry is either an absolute file path on disk (e.g. /Users/.../photo.png), an http(s):// URL, or a data: URI. When provided, routes via chat/completions for multimodal generation.",
+                        "description": "Optional list of reference inputs. Each entry is an absolute file path on disk (e.g. /Users/.../photo.png), an http(s):// URL, a data: URI, or the magic string 'clipboard' to read whatever image the user has copied (Cmd+C) on macOS. When provided, routes via chat/completions for multimodal generation.",
                     },
                     "output_dir": {"type": "string", "description": "Override default save directory"},
                     "raw": {"type": "boolean", "description": "Skip BRAND_PRESET injection", "default": False},
@@ -756,7 +793,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "reference_image": {
                         "type": "string",
-                        "description": "Optional first-frame seed for the FIRST chunk. File path, http(s):// URL, or data: URI. Subsequent chunks always seed from the previous chunk's last frame.",
+                        "description": "Optional first-frame seed for the FIRST chunk. File path, http(s):// URL, data: URI, or 'clipboard' to use the image currently copied on macOS. Subsequent chunks always seed from the previous chunk's last frame.",
                     },
                     "scene_prompts": {
                         "type": "array",
@@ -807,19 +844,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         refs = arguments.get("reference_images")
         if refs is not None and not isinstance(refs, list):
             return [TextContent(type="text", text="❌ reference_images must be an array of file paths or URLs")]
-        resolved_model = (arguments.get("model") or cfg.get("DEFAULT_IMAGE_MODEL") or "").strip()
-        if not resolved_model:
-            return [TextContent(type="text", text=(
-                "❌ No image model resolved. Either:\n"
-                "  • Pass model=<name> in this call (e.g. model='nano-banana')\n"
-                "  • Or set DEFAULT_IMAGE_MODEL=<name> in ~/.config/veltria-genmedia/gateway.env\n"
-                "    (your gateway exposes the available names at GET /v1/models)"
-            ))]
         try:
             result = await call_image(
                 cfg,
                 prompt=arguments["prompt"],
-                model=resolved_model,
+                model=arguments.get("model", cfg.get("DEFAULT_IMAGE_MODEL", "")),
                 n=int(arguments.get("n", 1)),
                 size=arguments.get("size"),
                 raw=bool(arguments.get("raw", False)),
@@ -839,18 +868,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         scene_prompts = arguments.get("scene_prompts")
         if scene_prompts is not None and not isinstance(scene_prompts, list):
             return [TextContent(type="text", text="❌ scene_prompts must be an array of strings")]
-        resolved_model = (arguments.get("model") or cfg.get("DEFAULT_VIDEO_MODEL") or "").strip()
-        if not resolved_model:
-            return [TextContent(type="text", text=(
-                "❌ No video model resolved. Either:\n"
-                "  • Pass model=<name> in this call (e.g. model='veo-2')\n"
-                "  • Or set DEFAULT_VIDEO_MODEL=<name> in ~/.config/veltria-genmedia/gateway.env"
-            ))]
         try:
             result = await call_video(
                 cfg,
                 prompt=arguments["prompt"],
-                model=resolved_model,
+                model=arguments.get("model", cfg.get("DEFAULT_VIDEO_MODEL", "")),
                 duration_sec=int(arguments.get("duration_sec", 5)),
                 aspect_ratio=arguments.get("aspect_ratio"),
                 raw=bool(arguments.get("raw", False)),
@@ -873,18 +895,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=msg)]
 
     if name == "gen_text":
-        resolved_model = (arguments.get("model") or cfg.get("DEFAULT_TEXT_MODEL") or "").strip()
-        if not resolved_model:
-            return [TextContent(type="text", text=(
-                "❌ No text model resolved. Either:\n"
-                "  • Pass model=<name> in this call (e.g. model='gemini-flash')\n"
-                "  • Or set DEFAULT_TEXT_MODEL=<name> in ~/.config/veltria-genmedia/gateway.env"
-            ))]
         try:
             text = await call_chat(
                 cfg,
                 prompt=arguments["prompt"],
-                model=resolved_model,
+                model=arguments.get("model", cfg.get("DEFAULT_TEXT_MODEL", "")),
                 system=arguments.get("system"),
             )
         except httpx.HTTPStatusError as e:
