@@ -807,11 +807,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         refs = arguments.get("reference_images")
         if refs is not None and not isinstance(refs, list):
             return [TextContent(type="text", text="❌ reference_images must be an array of file paths or URLs")]
+        resolved_model = (arguments.get("model") or cfg.get("DEFAULT_IMAGE_MODEL") or "").strip()
+        if not resolved_model:
+            return [TextContent(type="text", text=(
+                "❌ No image model resolved. Either:\n"
+                "  • Pass model=<name> in this call (e.g. model='nano-banana')\n"
+                "  • Or set DEFAULT_IMAGE_MODEL=<name> in ~/.config/veltria-genmedia/gateway.env\n"
+                "    (your gateway exposes the available names at GET /v1/models)"
+            ))]
         try:
             result = await call_image(
                 cfg,
                 prompt=arguments["prompt"],
-                model=arguments.get("model", cfg.get("DEFAULT_IMAGE_MODEL", "")),
+                model=resolved_model,
                 n=int(arguments.get("n", 1)),
                 size=arguments.get("size"),
                 raw=bool(arguments.get("raw", False)),
@@ -831,11 +839,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         scene_prompts = arguments.get("scene_prompts")
         if scene_prompts is not None and not isinstance(scene_prompts, list):
             return [TextContent(type="text", text="❌ scene_prompts must be an array of strings")]
+        resolved_model = (arguments.get("model") or cfg.get("DEFAULT_VIDEO_MODEL") or "").strip()
+        if not resolved_model:
+            return [TextContent(type="text", text=(
+                "❌ No video model resolved. Either:\n"
+                "  • Pass model=<name> in this call (e.g. model='veo-2')\n"
+                "  • Or set DEFAULT_VIDEO_MODEL=<name> in ~/.config/veltria-genmedia/gateway.env"
+            ))]
         try:
             result = await call_video(
                 cfg,
                 prompt=arguments["prompt"],
-                model=arguments.get("model", cfg.get("DEFAULT_VIDEO_MODEL", "")),
+                model=resolved_model,
                 duration_sec=int(arguments.get("duration_sec", 5)),
                 aspect_ratio=arguments.get("aspect_ratio"),
                 raw=bool(arguments.get("raw", False)),
@@ -858,11 +873,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=msg)]
 
     if name == "gen_text":
+        resolved_model = (arguments.get("model") or cfg.get("DEFAULT_TEXT_MODEL") or "").strip()
+        if not resolved_model:
+            return [TextContent(type="text", text=(
+                "❌ No text model resolved. Either:\n"
+                "  • Pass model=<name> in this call (e.g. model='gemini-flash')\n"
+                "  • Or set DEFAULT_TEXT_MODEL=<name> in ~/.config/veltria-genmedia/gateway.env"
+            ))]
         try:
             text = await call_chat(
                 cfg,
                 prompt=arguments["prompt"],
-                model=arguments.get("model", cfg.get("DEFAULT_TEXT_MODEL", "")),
+                model=resolved_model,
                 system=arguments.get("system"),
             )
         except httpx.HTTPStatusError as e:

@@ -320,6 +320,9 @@ prev_url=$(get_cfg GATEWAY_BASE_URL)
 prev_image_dir=$(get_cfg DEFAULT_IMAGE_OUTPUT_DIR)
 prev_video_dir=$(get_cfg DEFAULT_VIDEO_OUTPUT_DIR)
 prev_brand=$(get_cfg BRAND_PRESET)
+prev_image_model=$(get_cfg DEFAULT_IMAGE_MODEL)
+prev_video_model=$(get_cfg DEFAULT_VIDEO_MODEL)
+prev_text_model=$(get_cfg DEFAULT_TEXT_MODEL)
 prev_key_set=0
 [ -n "$(get_cfg GATEWAY_API_KEY)" ] && prev_key_set=1
 
@@ -346,6 +349,11 @@ def_client="${GENMEDIA_CLIENT:-$prev_client}"
 def_image_dir="${GENMEDIA_IMAGE_DIR:-${prev_image_dir:-$HOME/Pictures/genmedia}}"
 def_video_dir="${GENMEDIA_VIDEO_DIR:-${prev_video_dir:-$HOME/Movies/genmedia}}"
 def_brand="${GENMEDIA_BRAND_PRESET:-$prev_brand}"
+# Default model names — empty unless caller / previous config provides one.
+# Wizard prompts for each so a fresh install isn't stuck with blank defaults.
+def_image_model="${GENMEDIA_DEFAULT_IMAGE_MODEL:-$prev_image_model}"
+def_video_model="${GENMEDIA_DEFAULT_VIDEO_MODEL:-$prev_video_model}"
+def_text_model="${GENMEDIA_DEFAULT_TEXT_MODEL:-$prev_text_model}"
 
 if [ "$HEADLESS" = "1" ]; then
   GATEWAY_URL="$def_url"
@@ -354,6 +362,9 @@ if [ "$HEADLESS" = "1" ]; then
   IMAGE_DIR="$def_image_dir"
   VIDEO_DIR="$def_video_dir"
   BRAND_PRESET="$def_brand"
+  IMAGE_MODEL="$def_image_model"
+  VIDEO_MODEL="$def_video_model"
+  TEXT_MODEL="$def_text_model"
   if [ -z "$GATEWAY_URL" ] || [ -z "$API_KEY" ]; then
     err "--headless requires GENMEDIA_GATEWAY_URL and GENMEDIA_API_KEY (or a previous config to reuse)"
     exit 1
@@ -395,6 +406,15 @@ else
   echo
   IMAGE_DIR=$(prompt "Save generated images to" "$def_image_dir")
   VIDEO_DIR=$(prompt "Save generated videos to" "$def_video_dir")
+
+  # Default model names — saved to gateway.env so callers don't need to pass
+  # `model=...` on every request. Sensible suggestions for InfraX-style
+  # LiteLLM setups; users with different gateway names can override.
+  echo
+  say "Default model names per category (Enter to use the suggestion if blank):"
+  IMAGE_MODEL=$(prompt "Default IMAGE model" "${def_image_model:-nano-banana}")
+  VIDEO_MODEL=$(prompt "Default VIDEO model" "${def_video_model:-veo-2}")
+  TEXT_MODEL=$(prompt "Default TEXT  model" "${def_text_model:-gemini-flash}")
 
   echo
   BRAND_PRESET=$(prompt "Brand preset (free-form, prepended to every image prompt — Enter to skip)" "$def_brand")
@@ -463,9 +483,9 @@ GATEWAY_BASE_URL=$GATEWAY_URL
 GATEWAY_API_KEY=$API_KEY
 AUTH_HEADER=x-api-key
 
-DEFAULT_IMAGE_MODEL=
-DEFAULT_VIDEO_MODEL=
-DEFAULT_TEXT_MODEL=
+DEFAULT_IMAGE_MODEL=$IMAGE_MODEL
+DEFAULT_VIDEO_MODEL=$VIDEO_MODEL
+DEFAULT_TEXT_MODEL=$TEXT_MODEL
 
 DEFAULT_IMAGE_OUTPUT_DIR=$IMAGE_DIR
 DEFAULT_VIDEO_OUTPUT_DIR=$VIDEO_DIR
